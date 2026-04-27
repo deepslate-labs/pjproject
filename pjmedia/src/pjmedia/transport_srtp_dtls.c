@@ -1048,13 +1048,16 @@ static pj_status_t parse_setup_finger_attr(dtls_srtp *ds,
     if (!a)
         return PJMEDIA_SRTP_ESDPAMBIGUEANS;
 
-    if (pj_stristr(&a->value, &ID_PASSIVE) ||
-        (rem_as_offerer && pj_stristr(&a->value, &ID_ACTPASS)))
-    {
-        /* Remote offers/answers 'passive' (or offers 'actpass'), so we are
-         * the client.
-         */
+    if (pj_stristr(&a->value, &ID_PASSIVE)) {
+        /* Remote offers/answers 'passive' so we are the client. */
         ds->setup = DTLS_SETUP_ACTIVE;
+    } else if (rem_as_offerer && pj_stristr(&a->value, &ID_ACTPASS)) {
+        /* If remote offers 'actpass' and our setup is unknown,
+         * we choose the role as the client, otherwise we maintain
+         * the current setup to avoid establishing new DTLS connection.
+         */
+        if (ds->setup == DTLS_SETUP_UNKNOWN)
+            ds->setup = DTLS_SETUP_ACTIVE;
     } else if (pj_stristr(&a->value, &ID_ACTIVE)) {
         /* Remote offers/answers 'active' so we are the server. */
         ds->setup = DTLS_SETUP_PASSIVE;
@@ -1296,6 +1299,7 @@ static pj_status_t dtls_on_recv(pjmedia_transport *tp, unsigned idx,
         pjmedia_transport_get_info(ds->srtp->member_tp, &info);
 
         if (idx == RTP_CHANNEL &&
+            pj_sockaddr_has_addr(&info.src_rtp_name) &&
             pj_sockaddr_cmp(&ds->rem_addr, &info.src_rtp_name))
         {
             pj_sockaddr_cp(&ds->rem_addr, &info.src_rtp_name);

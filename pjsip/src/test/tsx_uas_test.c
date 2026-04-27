@@ -164,8 +164,8 @@ static struct tsx_uas_test_global_t
 
 #define TEST_TIMEOUT_ERROR      -30
 
-// An effort to accommodate CPU load spike on some test machines.
-#define MAX_ALLOWED_DIFF        500 //150
+/* Widen timing tolerance in CI mode — shared runners can be 5-10x slower. */
+#define MAX_ALLOWED_DIFF    (test_app.ut_app.prm_ci_mode ? 2500 : 500)
 
 static void tsx_user_on_tsx_state(pjsip_transaction *tsx, pjsip_event *e);
 static pj_bool_t on_rx_message(pjsip_rx_data *rdata);
@@ -217,14 +217,14 @@ struct response
 static unsigned get_tsx_tid(const pjsip_transaction *tsx)
 {
     pj_assert(tsx_user.id >= 0);
-    return (unsigned)(long)tsx->mod_data[tsx_user.id];
+    return (unsigned)(uintptr_t)tsx->mod_data[tsx_user.id];
 }
 
 
 static void init_tsx(pjsip_transaction *tsx, unsigned tid)
 {
     pj_assert(tsx_user.id >= 0);
-    tsx->mod_data[tsx_user.id] = (void*)(long)tid;
+    tsx->mod_data[tsx_user.id] = (void*)(uintptr_t)tid;
 
     /* Must select specific transport to use for loop */
     if (g[tid].test_param->type == PJSIP_TRANSPORT_LOOP_DGRAM) {
@@ -1733,6 +1733,8 @@ static int tsx_transport_failure_test(unsigned tid)
             return -41;
         }
     }
+
+    pjsip_endpt_stop_handle_events(endpt);
 
     return 0;
 }

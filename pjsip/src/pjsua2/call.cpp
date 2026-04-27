@@ -15,7 +15,6 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-#include <pjsua2/account.hpp>
 #include <pjsua2/call.hpp>
 #include <pjsua2/endpoint.hpp>
 #include <pj/ctype.h>
@@ -370,6 +369,9 @@ void StreamInfo::fromPj(const pjsua_stream_info &info)
         jbDiscardAlgo = info.info.aud.jb_discard_algo;
 #if defined(PJMEDIA_STREAM_ENABLE_KA) && (PJMEDIA_STREAM_ENABLE_KA != 0)
         useKa = PJ2BOOL(info.info.aud.use_ka);
+        startCountKa = info.info.aud.ka_cfg.start_count;
+        startIntervalKa =  info.info.aud.ka_cfg.start_interval;
+        intervalKa = info.info.aud.ka_cfg.ka_interval;
 #endif
         rtcpSdesByeDisabled = PJ2BOOL(info.info.aud.rtcp_sdes_bye_disabled);
     } else if (type == PJMEDIA_TYPE_VIDEO) {
@@ -391,6 +393,9 @@ void StreamInfo::fromPj(const pjsua_stream_info &info)
         jbDiscardAlgo = PJMEDIA_JB_DISCARD_NONE;
 #if defined(PJMEDIA_STREAM_ENABLE_KA) && (PJMEDIA_STREAM_ENABLE_KA != 0)
         useKa = PJ2BOOL(info.info.vid.use_ka);
+        startCountKa = info.info.vid.ka_cfg.start_count;
+        startIntervalKa =  info.info.vid.ka_cfg.start_interval;
+        intervalKa = info.info.vid.ka_cfg.ka_interval;
 #endif
         rtcpSdesByeDisabled = PJ2BOOL(info.info.vid.rtcp_sdes_bye_disabled);
     } else if (type == PJMEDIA_TYPE_TEXT) {
@@ -411,6 +416,9 @@ void StreamInfo::fromPj(const pjsua_stream_info &info)
         jbDiscardAlgo = PJMEDIA_JB_DISCARD_NONE;
 #if defined(PJMEDIA_STREAM_ENABLE_KA) && (PJMEDIA_STREAM_ENABLE_KA != 0)
         useKa = PJ2BOOL(info.info.txt.use_ka);
+        startCountKa = info.info.txt.ka_cfg.start_count;
+        startIntervalKa =  info.info.txt.ka_cfg.start_interval;
+        intervalKa = info.info.txt.ka_cfg.ka_interval;
 #endif
         rtcpSdesByeDisabled = PJ2BOOL(info.info.txt.rtcp_sdes_bye_disabled);
     }
@@ -491,7 +499,7 @@ call_param::call_param(const SipTxOption &tx_option, const CallSetting &setting,
     p_reason = (reason.slen == 0? NULL: &reason);
 
     sdp = NULL;
-    if (sdp_str != "") {
+    if (pool != NULL && sdp_str != "") {
         pj_str_t dup_pj_sdp;
         pj_str_t pj_sdp_str = {(char*)sdp_str.c_str(),
                                (pj_ssize_t)sdp_str.size()};
@@ -508,7 +516,7 @@ call_param::call_param(const SipTxOption &tx_option, const CallSetting &setting,
 }
 
 Call::Call(Account& account, int call_id)
-: acc(account), id(call_id), userData(NULL), sdp_pool(NULL), child(NULL)
+: acc(&account), id(call_id), userData(NULL), child(NULL)
 {
     if (call_id != PJSUA_INVALID_ID)
         pjsua_call_set_user_data(call_id, this);
@@ -745,15 +753,25 @@ void Call::makeCall(const string &dst_uri, const CallOpParam &prm)
     pj_str_t pj_dst_uri = str2Pj(dst_uri);
     call_param param(prm.txOption, prm.opt, prm.reason);
     
-    PJSUA2_CHECK_EXPR( pjsua_call_make_call(acc.getId(), &pj_dst_uri,
+    PJSUA2_CHECK_EXPR( pjsua_call_make_call(acc->getId(), &pj_dst_uri,
                                             param.p_opt, this,
                                             param.p_msg_data, &id) );
 }
 
 void Call::answer(const CallOpParam &prm) PJSUA2_THROW(Error)
 {
+    pj_pool_t *tmp_pool = NULL;
+    
+    /* Create temporary pool for SDP operations if SDP is provided */
+    if (!prm.sdp.wholeSdp.empty()) {
+        tmp_pool = pjsua_pool_create("tmp-answer", 2048, 512);
+        if (!tmp_pool) {
+            PJSUA2_RAISE_ERROR2(PJ_ENOMEM, "Call::answer()");
+        }
+    }
+    
     call_param param(prm.txOption, prm.opt, prm.reason,
-                     sdp_pool, prm.sdp.wholeSdp);
+                     tmp_pool, prm.sdp.wholeSdp);
     
     if (param.sdp) {
         PJSUA2_CHECK_EXPR( pjsua_call_answer_with_sdp(id, param.sdp,
@@ -765,6 +783,11 @@ void Call::answer(const CallOpParam &prm) PJSUA2_THROW(Error)
         PJSUA2_CHECK_EXPR( pjsua_call_answer2(id, param.p_opt, prm.statusCode,
                                               param.p_reason,
                                               param.p_msg_data) );
+    }
+    
+    /* Release temporary pool */
+    if (tmp_pool) {
+        pj_pool_release(tmp_pool);
     }
 }
 

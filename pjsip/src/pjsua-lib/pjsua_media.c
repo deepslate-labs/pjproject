@@ -96,6 +96,10 @@ pj_status_t pjsua_media_subsys_init(const pjsua_media_config *cfg)
         pjsua_var.media_cfg.max_media_ports = pjsua_var.ua_cfg.max_calls + 2;
     }
 
+    if (pjsua_var.media_cfg.conf_threads < 1) {
+        pjsua_var.media_cfg.conf_threads = 1;
+    }
+
     /* Create media endpoint. */
     status = pjmedia_endpt_create(&pjsua_var.cp.factory, 
                                   pjsua_var.media_cfg.has_ioqueue? NULL :
@@ -1263,6 +1267,13 @@ static pj_status_t create_ice_media_transport(
 
             /* Configure max packet size */
             ice_cfg.stun_tp[i].cfg.max_pkt_size = PJMEDIA_MAX_MRU;
+
+            /* Configure manual host candidates */
+            ice_cfg.stun_tp[i].manual_host_cnt =
+                                        acc_cfg->ice_cfg.ice_manual_host_cnt;
+            pj_memcpy(&ice_cfg.stun_tp[i].manual_host,
+                      &acc_cfg->ice_cfg.ice_manual_host,
+                      sizeof(ice_cfg.stun_tp[i].manual_host));
         }
     }
 
@@ -2416,13 +2427,13 @@ pj_status_t pjsua_media_channel_init(pjsua_call_id call_id,
     const pj_str_t STR_TEXT  = { "text", 4 };
     pjsua_call *call = &pjsua_var.calls[call_id];
     pjsua_acc *acc = &pjsua_var.acc[call->acc_id];
-    pj_uint8_t maudidx[PJSUA_MAX_CALL_MEDIA];
+    pj_uint8_t maudidx[PJSUA_MAX_CALL_MEDIA] = {0};
     unsigned maudcnt = PJ_ARRAY_SIZE(maudidx);
     unsigned mtotaudcnt = PJ_ARRAY_SIZE(maudidx);
-    pj_uint8_t mvididx[PJSUA_MAX_CALL_MEDIA];
+    pj_uint8_t mvididx[PJSUA_MAX_CALL_MEDIA] = {0};
     unsigned mvidcnt = PJ_ARRAY_SIZE(mvididx);
     unsigned mtotvidcnt = PJ_ARRAY_SIZE(mvididx);
-    pj_uint8_t mtxtidx[PJSUA_MAX_CALL_MEDIA];
+    pj_uint8_t mtxtidx[PJSUA_MAX_CALL_MEDIA] = {0};
     unsigned mtxtcnt = PJ_ARRAY_SIZE(mtxtidx);
     unsigned mtottxtcnt = PJ_ARRAY_SIZE(mtxtidx);
     unsigned mi;
@@ -3318,6 +3329,22 @@ pj_status_t pjsua_media_channel_create_sdp(pjsua_call_id call_id,
                                                    pool, rem_sdp);
     }
 
+    if (sdp->media_count > PJSUA_MAX_CALL_MEDIA) {
+        PJ_LOG(1, (THIS_FILE,
+                   "Error in provided SDP: media count %u exceeds "
+                   "PJSUA_MAX_CALL_MEDIA=%u",
+                   sdp->media_count, PJSUA_MAX_CALL_MEDIA));
+        status = PJ_ETOOMANY;
+        goto on_error;
+    }
+
+    /* Sync med_prov_cnt with the final SDP media count in case the callback
+     * added or replaced media sections (e.g. custom SDP with more m= lines).
+     * Mirrors the same invariant maintained for the rem_sdp (UAS) path above:
+     * med_prov_cnt must never decrease. */
+    if (call->med_prov_cnt < sdp->media_count)
+        call->med_prov_cnt = sdp->media_count;
+
     *p_sdp = sdp;
     return PJ_SUCCESS;
 
@@ -3711,10 +3738,10 @@ static void check_srtp_roc(pjsua_call *call,
     }
     
 #if 0
-    PJ_LOG(4, (THIS_FILE, "SRTP TX ROC %d %d",
+    PJ_LOG(4, (THIS_FILE, "SRTP TX ROC %u %d",
                           call_med->prev_srtp_info.tx_roc.ssrc,
                           call_med->prev_srtp_info.tx_roc.roc));
-    PJ_LOG(4, (THIS_FILE, "SRTP RX ROC %d %d",
+    PJ_LOG(4, (THIS_FILE, "SRTP RX ROC %u %d",
                           call_med->prev_srtp_info.rx_roc.ssrc,
                           call_med->prev_srtp_info.rx_roc.roc));
 #endif
@@ -4123,7 +4150,7 @@ static pj_status_t apply_med_update(pjsua_call_media *call_med,
         }
 
         if (call->audio_idx==-1 && status==PJ_SUCCESS &&
-            si->dir != PJMEDIA_DIR_NONE)
+            call_med->tp && local_sdp->media[mi]->desc.port != 0)
         {
             call->audio_idx = mi;
         }
@@ -4385,15 +4412,15 @@ pj_status_t pjsua_media_channel_update(pjsua_call_id call_id,
     const pj_str_t STR_AUDIO = { "audio", 5 };
     const pj_str_t STR_VIDEO = { "video", 5 };
     const pj_str_t STR_TEXT  = { "text", 4 };
-    pj_uint8_t maudidx[PJSUA_MAX_CALL_MEDIA];
+    pj_uint8_t maudidx[PJSUA_MAX_CALL_MEDIA] = {0};
     unsigned maudcnt = PJ_ARRAY_SIZE(maudidx);
     unsigned mtotaudcnt = PJ_ARRAY_SIZE(maudidx);
-    pj_uint8_t mvididx[PJSUA_MAX_CALL_MEDIA];
+    pj_uint8_t mvididx[PJSUA_MAX_CALL_MEDIA] = {0};
     unsigned mvidcnt = PJ_ARRAY_SIZE(mvididx);
     unsigned mtotvidcnt = PJ_ARRAY_SIZE(mvididx);
-    pj_uint8_t mtxtidx[PJSUA_MAX_CALL_MEDIA];
-    unsigned mtxtcnt = PJ_ARRAY_SIZE(mvididx);
-    unsigned mtottxtcnt = PJ_ARRAY_SIZE(mvididx);
+    pj_uint8_t mtxtidx[PJSUA_MAX_CALL_MEDIA] = {0};
+    unsigned mtxtcnt = PJ_ARRAY_SIZE(mtxtidx);
+    unsigned mtottxtcnt = PJ_ARRAY_SIZE(mtxtidx);
     pj_bool_t need_renego_sdp = PJ_FALSE;
 
     if (pjsua_get_state() != PJSUA_STATE_RUNNING)

@@ -652,7 +652,7 @@ PJ_DECL(pj_status_t) pjsip_endpt_atexit(pjsip_endpoint *endpt,
 PJ_DECL(void) pjsip_endpt_log_error( pjsip_endpoint *endpt,
                                      const char *sender,
                                      pj_status_t error_code,
-                                     const char *format,
+                                     PJ_PRINT_PARAM_DECOR const char *format,
                                      ... )
                                      PJ_PRINT_FUNC_DECOR(4);
 
@@ -666,6 +666,13 @@ PJ_DECL(void) pjsip_endpt_log_error( pjsip_endpoint *endpt,
                 if ((tracing))          \
                     PJ_LOG(4,expr);     \
             } while (0)
+
+/**
+ * Internal API to signal that app has stopped its event handling loop.
+ * This can be useful for apps that want to add/remove modules and avoid
+ * race with event processing.
+ */
+void pjsip_endpt_stop_handle_events(pjsip_endpoint *endpt);
 
 PJ_END_DECL
 

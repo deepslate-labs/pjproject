@@ -311,6 +311,17 @@ struct AccountSipConfig : public PersistentObject
      */
     bool        useSharedAuth;
 
+    /**
+     * Configure automatic SIP-MESSAGE processing behavior for this account.
+     * When set to true, incoming SIP MESSAGE requests will be responded to
+     * immediately with a 200 OK response (legacy behavior). When set to false,
+     * incoming SIP MESSAGE requests will create UAS transactions allowing for
+     * deferred responses, cf. Account::sendResponse() and DeferredResponse.
+     *
+     * Default: true (automatic response for backward compatibility)
+     */
+    bool        autoRespondSipMessage;
+
 public:
     /**
      * Read this object from a container node.
@@ -572,6 +583,14 @@ struct AccountNatConfig : public PersistentObject
      * Default: -1 (maximum not set)
      */
     int                 iceMaxHostCands;
+
+    /**
+     * Optional configuration to manually specify host candidates.
+     * Each candidate will use the same port as the automatic/base host
+     * candidate. The number of entries in this array must be equal or less
+     * than \a iceMaxHostCands.
+     */
+    SocketAddressVector iceManualHost;
 
     /**
      * Specify whether to use aggressive nomination.
@@ -859,8 +878,6 @@ public:
      */
     SendRequestParam();
 };
-
-
 
 /**
  * SRTP crypto.
@@ -1865,6 +1882,133 @@ struct OnSendRequestParam
 
 
 /**
+ * Represents a pending authentication challenge.
+ * Call respond() to resend with authentication, or abandon() to give up.
+ * If neither is called before the callback returns, the library handles
+ * authentication automatically using configured credentials (sync path).
+ *
+ * For async use, call defer() during the callback to obtain a heap-allocated
+ * AuthChallenge that can be used later. The caller owns the returned object.
+ *
+ * Each AuthChallenge is single-use: once consumed by respond(), abandon(),
+ * or defer(), further calls return PJ_EINVALIDOP (defer() throws Error).
+ *
+ * Thread safety: on a deferred object, respond() and abandon() must be called
+ * from a pjlib-registered thread. The non-deferred object must only be used
+ * during the onAuthChallenge() callback.
+ *
+ * GC note (Python/Java): The destructor calls pjsip APIs which require a
+ * pjlib-registered thread. Since garbage collectors may run destructor/
+ * Release() on an unregistered finalizer thread, you MUST explicitly call
+ * respond(), abandon(), or delete/Release() on the deferred object from a
+ * pjlib-registered thread. Do NOT let the GC collect it implicitly.
+ * See https://docs.pjsip.org/en/latest/pjsua2/general_concept.html#problems-with-garbage-collection
+ */
+class AuthChallenge
+{
+public:
+    AuthChallenge();
+
+    /**
+     * Destructor. If this is a deferred challenge that was never consumed
+     * by respond() or abandon(), destruction will auto-abandon the pending
+     * authentication and release associated resources.
+     */
+    ~AuthChallenge();
+
+    /**
+     * Defer the challenge for asynchronous handling. Creates a new
+     * heap-allocated AuthChallenge that can be used after the callback
+     * returns. The caller owns the returned object and must eventually
+     * call respond() or abandon() on it (or simply delete it, which
+     * auto-abandons).
+     *
+     * Must be called during the onAuthChallenge() callback. After this
+     * call, the original AuthChallenge becomes invalid.
+     *
+     * @return          New heap-allocated AuthChallenge (caller owns).
+     */
+    AuthChallenge* defer() PJSUA2_THROW(Error);
+
+    /**
+     * Respond to the authentication challenge by building and sending
+     * an authenticated request. Uses credentials currently configured
+     * on the auth session.
+     *
+     * @return          PJ_SUCCESS on success, or PJ_EINVALIDOP if already
+     *                  consumed by a prior respond()/abandon()/defer() call.
+     */
+    pj_status_t respond();
+
+    /**
+     * Respond with provided credentials. Sets them on the account-level
+     * shared auth session before building the authenticated request.
+     * Note that this permanently replaces the account's credentials,
+     * affecting all subsequent authentication for the account.
+     *
+     * @param creds     Credentials to set on the auth session.
+     * @return          PJ_SUCCESS on success.
+     */
+    pj_status_t respond(const AuthCredInfoVector &creds);
+
+    /**
+     * Abandon the authentication challenge. The pending request will
+     * not be resent.
+     *
+     * @return          PJ_SUCCESS on success, or PJ_EINVALIDOP if already
+     *                  consumed by a prior respond()/abandon()/defer() call.
+     */
+    pj_status_t abandon();
+
+    /**
+     * Check whether this challenge object is still valid (not yet
+     * consumed by respond() or abandon(), and the associated account
+     * is still active).
+     *
+     * Note: this is an advisory check without synchronization.
+     * The result may be stale if another thread concurrently
+     * deletes the account.
+     *
+     * @return          true if valid.
+     */
+    bool isValid() const;
+
+private:
+    friend class Endpoint;
+
+    AuthChallenge(const AuthChallenge&);
+    AuthChallenge& operator=(const AuthChallenge&);
+
+    pjsua_on_auth_challenge_param  *param_;
+    bool                            deferred_;
+    bool                            consumed_;
+    pjsip_rx_data                  *cloned_rdata_;
+    pjsip_auth_clt_sess           *auth_sess_;
+    void                           *token_;
+    pjsip_tx_data                  *tdata_;
+    pjsua_acc_id                    acc_id_;
+};
+
+/**
+ * Parameters for Account::onAuthChallenge() callback.
+ */
+struct OnAuthChallengeParam
+{
+    /** Account ID associated with the challenged request. */
+    pjsua_acc_id        accId;
+
+    /** Call ID, or PJSUA_INVALID_ID for non-call requests. */
+    pjsua_call_id       callId;
+
+    /** The 401/407 response containing the challenge. */
+    SipRxData           rdata;
+
+    /** The authentication challenge. Call respond() or abandon(). */
+    AuthChallenge       challenge;
+};
+
+
+/**
  * Parameters for presNotify() account method.
  */
 struct PresNotifyParam
@@ -1931,6 +2075,110 @@ public:
     virtual ~FindBuddyMatch() {}
 };
 
+/**
+ * This class is used to store the received parsed SIP MESSAGE request and
+ * its transaction for use in sendResponse().
+ */
+class DeferredResponse
+{
+    friend class Account;
+public:
+    /**
+     * Constructor that clones the rx_data and keeps a non-owning pointer
+     * to the transaction.
+     * @param param        The instant message parameters from the callback.
+     */
+    explicit
+    DeferredResponse(const OnInstantMessageParam& param) PJSUA2_THROW(Error);
+
+    /**
+     * Constructs an empty object. Must be assigned to before use.
+     */
+    DeferredResponse();
+
+     /**
+      * Copies the deferred response object by cloning the rx_data.
+      */
+    DeferredResponse(const DeferredResponse& deferredResponse)
+        PJSUA2_THROW(Error);
+
+    /**
+     * Copies the deferred response object by cloning the rx_data.
+     */
+    DeferredResponse& operator=(const DeferredResponse& deferredResponse)
+        PJSUA2_THROW(Error);
+
+    /* SWIG 4.x doesn't reliably match rvalue-reference signatures in
+     * %ignore, and the target languages (Java/C#/Python) have no concept
+     * of move semantics anyway. Hide the move ctor/assignment from SWIG.
+     */
+#ifndef SWIG
+    /**
+     * Moves the deferred response object.
+     */
+    DeferredResponse(DeferredResponse&& deferredResponse) noexcept;
+
+    /**
+     * Moves the deferred response object.
+     */
+    DeferredResponse& operator=(DeferredResponse&& deferredResponse) noexcept;
+#endif
+
+    /**
+     * Destructor that frees possible cloned rx_data.
+     */
+    virtual ~DeferredResponse();
+
+private:
+    /**
+     * Non-owning pointer to the registered transaction.
+     */
+    pjsip_transaction* transaction;
+
+    /**
+     * Owning pointer to the cloned rx_data.
+     */
+    pjsip_rx_data* data = nullptr;
+};
+
+/**
+ * Parameters for Account::sendResponse().
+ */
+struct SendResponseParam
+{
+    /**
+     * Deferred response object, which is valid until the response is sent.
+     */
+    DeferredResponse deferredResponse;
+
+    /**
+     * Status code of the response.
+     */
+    int         code;
+
+    /**
+     * Optional reason phrase of the response.
+     */
+    string      reason;
+};
+
+/**
+ * Parameters for Account::shutdown2().
+ */
+struct AccountShutdownParam
+{
+    /**
+     * If true, the account will always be deleted even when there are
+     * active calls using it (a warning will be logged). If false, the
+     * function will throw an Error with PJ_EBUSY when active calls exist.
+     *
+     * Default: false
+     */
+    bool        force;
+
+    /** Default constructor */
+    AccountShutdownParam() : force(false) {}
+};
 
 /**
  * Account.
@@ -1944,8 +2192,9 @@ public:
     Account();
 
     /**
-     * Destructor. Note that if the account is deleted, it will also delete
-     * the corresponding account in the PJSUA-LIB.
+     * Destructor. This will call shutdown() to always delete the
+     * corresponding account in the PJSUA-LIB, even if there are active
+     * calls. This ensures no resource leak occurs.
      *
      * If application implements a derived class, the derived class should
      * call shutdown() in the beginning stage in its destructor, or
@@ -1971,8 +2220,14 @@ public:
                 bool make_default=false) PJSUA2_THROW(Error);
 
     /**
-     * Shutdown the account. This will initiate unregistration if needed,
-     * and delete the corresponding account in the PJSUA-LIB.
+     * Shutdown the account. This will always delete the account
+     * (force=true), initiating unregistration if needed, and deleting the
+     * corresponding account in the PJSUA-LIB. Active calls will not
+     * prevent deletion; a warning will be logged if any exist.
+     *
+     * This method does not throw an exception. Any error will be logged
+     * internally. For safer behavior that checks for active calls, use
+     * shutdown2() instead.
      *
      * Note that application must delete all Buddy instances belong to this
      * account before shutting down the account.
@@ -1984,6 +2239,20 @@ public:
      * the derived class destructor and Account callbacks.
      */
     void shutdown();
+
+    /**
+     * Shutdown the account, with additional options. This will initiate
+     * unregistration if needed, and delete the corresponding account in
+     * the PJSUA-LIB.
+     *
+     * Unlike shutdown(), this method throws an Error exception on failure.
+     * By default (force=false), if there are active calls still using this
+     * account, it will throw an Error with PJ_EBUSY status. Set force=true
+     * to always delete the account regardless.
+     *
+     * @param prm               Shutdown parameters.
+     */
+    void shutdown2(const AccountShutdownParam &prm) PJSUA2_THROW(Error);
 
     /**
      * Modify the account to use the specified account configuration.
@@ -2051,6 +2320,19 @@ public:
      *                      included in outgoing request.
      */
     void sendRequest(const pj::SendRequestParam& prm) PJSUA2_THROW(Error);
+
+    /**
+     * Send response for incoming request that was deferred earlier
+     * using DeferredResponse object.
+     *
+     * @param prm                   The response's parameters.
+     * @param prm.deferredResponse  The deferred response object
+     *                              identifying the incoming request to
+     *                              respond to.
+     * @param prm.code              The status code of the response.
+     * @param prm.reason            Optional reason phrase of the response.
+     */
+    void sendResponse(const pj::SendResponseParam& prm) PJSUA2_THROW(Error);
 
     /**
      * Update registration or perform unregistration. Application normally
@@ -2259,6 +2541,27 @@ public:
      * @param prm           Callback parameter.
      */
     virtual void onMwiInfo(OnMwiInfoParam &prm)
+    { PJ_UNUSED_ARG(prm); }
+
+    /**
+     * Called when a 401/407 challenge is received. Override to handle
+     * authentication challenges. Three usage patterns are supported:
+     *
+     * - Synchronous: call prm.challenge.respond() or
+     *   prm.challenge.respond(creds) directly within this callback.
+     * - Asynchronous: call prm.challenge.defer() to obtain a
+     *   heap-allocated AuthChallenge, then call respond() or abandon()
+     *   on it later from any context. The caller owns the returned object.
+     * - Default: if neither respond(), abandon(), nor defer() is called,
+     *   the library handles authentication automatically using configured
+     *   credentials.
+     *
+     * @param prm       Callback parameter.
+     *
+     * @see AuthChallenge
+     * @see OnAuthChallengeParam
+     */
+    virtual void onAuthChallenge(OnAuthChallengeParam &prm)
     { PJ_UNUSED_ARG(prm); }
 
 private:

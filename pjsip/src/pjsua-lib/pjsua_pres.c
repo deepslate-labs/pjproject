@@ -421,18 +421,21 @@ pjsua_buddy_get_dlg_event_info( pjsua_buddy_id buddy_id,
 PJ_DEF(pj_status_t) pjsua_buddy_set_user_data( pjsua_buddy_id buddy_id,
                                                void *user_data)
 {
-    struct buddy_lock lck;
-    pj_status_t status;
+    //struct buddy_lock lck;
+    //pj_status_t status;
 
     PJ_ASSERT_RETURN(pjsua_buddy_is_valid(buddy_id), PJ_EINVAL);
 
-    status = lock_buddy("pjsua_buddy_set_user_data()", buddy_id, &lck, 0);
-    if (status != PJ_SUCCESS)
-        return status;
+    /* Locking may fail and validity check above should be sufficient.
+     * Other similar functions also skip locking.
+     */
+    //status = lock_buddy("pjsua_buddy_set_user_data()", buddy_id, &lck, 0);
+    //if (status != PJ_SUCCESS)
+    //    return status;
 
     pjsua_var.buddy[buddy_id].user_data = user_data;
 
-    unlock_buddy(&lck);
+    //unlock_buddy(&lck);
 
     return PJ_SUCCESS;
 }
@@ -443,19 +446,23 @@ PJ_DEF(pj_status_t) pjsua_buddy_set_user_data( pjsua_buddy_id buddy_id,
  */
 PJ_DEF(void*) pjsua_buddy_get_user_data(pjsua_buddy_id buddy_id)
 {
-    struct buddy_lock lck;
-    pj_status_t status;
+    //struct buddy_lock lck;
+    //pj_status_t status;
     void *user_data;
 
     PJ_ASSERT_RETURN(pjsua_buddy_is_valid(buddy_id), NULL);
 
-    status = lock_buddy("pjsua_buddy_get_user_data()", buddy_id, &lck, 0);
-    if (status != PJ_SUCCESS)
-        return NULL;
+    /* Locking may fail and application has no idea whether the user_data
+     * is really NULL or locking failed, so we skip locking here.
+     * Other similar functions also skip locking.
+     */
+    //status = lock_buddy("pjsua_buddy_get_user_data()", buddy_id, &lck, 0);
+    //if (status != PJ_SUCCESS)
+    //    return NULL;
 
     user_data = pjsua_var.buddy[buddy_id].user_data;
 
-    unlock_buddy(&lck);
+    //unlock_buddy(&lck);
 
     return user_data;
 }
@@ -1523,8 +1530,21 @@ pj_status_t pjsua_pres_init_publish_acc(int acc_id)
 
         /* Add credential for authentication */
         if (acc->cred_cnt) {
-            pjsip_publishc_set_credentials(acc->publish_sess, acc->cred_cnt, 
+            pjsip_publishc_set_credentials(acc->publish_sess, acc->cred_cnt,
                                            acc->cred);
+        }
+
+        /* Set shared auth session for PUBLISH */
+        if (acc->cfg.use_shared_auth) {
+            pjsip_publishc_set_auth_sess(acc->publish_sess,
+                                         &acc->shared_auth_sess);
+        } else if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+            pjsip_auth_clt_async_setting async_opt;
+            pj_bzero(&async_opt, sizeof(async_opt));
+            async_opt.cb = &pjsua_auth_on_challenge;
+            async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+            pjsip_auth_clt_async_configure(
+                pjsip_publishc_get_auth_sess(acc->publish_sess), &async_opt);
         }
 
         /* Set route-set */
@@ -2133,11 +2153,17 @@ static void subscribe_buddy(pjsua_buddy_id buddy_id,
 
     if (acc->cfg.use_shared_auth) {
         pjsip_dlg_set_auth_sess(buddy->dlg, &acc->shared_auth_sess);
+    } else if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+        pjsip_auth_clt_async_configure(&buddy->dlg->auth_sess, &async_opt);
     }
 
     /* Set credentials */
     if (acc->cred_cnt) {
-        pjsip_auth_clt_set_credentials( &buddy->dlg->auth_sess, 
+        pjsip_auth_clt_set_credentials( &buddy->dlg->auth_sess,
                                         acc->cred_cnt, acc->cred);
     }
 
@@ -2491,9 +2517,19 @@ pj_status_t pjsua_start_mwi(pjsua_acc_id acc_id, pj_bool_t force_renew)
         pjsip_dlg_set_route_set(acc->mwi_dlg, &acc->route_set);
     }
 
+    if (acc->cfg.use_shared_auth) {
+        pjsip_dlg_set_auth_sess(acc->mwi_dlg, &acc->shared_auth_sess);
+    } else if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+        pjsip_auth_clt_async_configure(&acc->mwi_dlg->auth_sess, &async_opt);
+    }
+
     /* Set credentials */
     if (acc->cred_cnt) {
-        pjsip_auth_clt_set_credentials( &acc->mwi_dlg->auth_sess, 
+        pjsip_auth_clt_set_credentials( &acc->mwi_dlg->auth_sess,
                                         acc->cred_cnt, acc->cred);
     }
 
@@ -2691,6 +2727,12 @@ pj_status_t pjsua_pres_init()
                      status);
     }
 
+    if (pjsua_var.ua_cfg.enable_unsolicited_mwi) {
+        status = enable_unsolicited_mwi();
+        if (status != PJ_SUCCESS)
+            return status;
+    }
+
     for (i=0; i<PJ_ARRAY_SIZE(pjsua_var.buddy); ++i) {
         reset_buddy(i);
     }
@@ -2714,12 +2756,6 @@ pj_status_t pjsua_pres_start(void)
         pjsip_endpt_schedule_timer(pjsua_var.endpt, &pjsua_var.pres_timer,
                                    &pres_interval);
         pjsua_var.pres_timer.id = PJ_TRUE;
-    }
-
-    if (pjsua_var.ua_cfg.enable_unsolicited_mwi) {
-        pj_status_t status = enable_unsolicited_mwi();
-        if (status != PJ_SUCCESS)
-            return status;
     }
 
     return PJ_SUCCESS;

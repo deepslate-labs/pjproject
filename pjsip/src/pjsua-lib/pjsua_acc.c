@@ -35,6 +35,71 @@ static int get_ip_addr_ver(const pj_str_t *host);
 static void schedule_reregistration(pjsua_acc *acc);
 static void keep_alive_timer_cb(pj_timer_heap_t *th, pj_timer_entry *te);
 
+/* Bridge: maps low-level auth challenge -> pjsua on_auth_challenge */
+pj_bool_t pjsua_auth_on_challenge(
+                             pjsip_auth_clt_sess *sess,
+                             void *token,
+                             const pjsip_auth_clt_async_on_chal_param *param)
+{
+    pjsua_on_auth_challenge_param cb_param;
+    pjsua_acc_id acc_id = (pjsua_acc_id)(pj_ssize_t)param->user_data;
+    pjsua_call_id call_id = PJSUA_INVALID_ID;
+
+    PJ_UNUSED_ARG(sess);
+
+    /* Do NOT acquire PJSUA_LOCK here.  This callback is invoked with
+     * the transaction grp_lock held (pjsip_tsx_recv_msg -> state_handler
+     * -> regc_tsx_callback -> here), while pjsua_acc_del() holds
+     * PJSUA_LOCK (recursively via pjsua_acc_set_registration) and then
+     * acquires a tsx grp_lock through pjsip_regc_send ->
+     * pjsip_tsx_set_transport.  Acquiring PJSUA_LOCK here would create
+     * an ABBA lock-order inversion.
+     *
+     * This is safe without the lock because:
+     *  - pjsua_var.acc[] is a fixed-size static array; indexing is
+     *    always valid for a bounded acc_id.
+     *  - A racy read of the 'valid' flag can only produce a false
+     *    positive (proceed with a just-deleted account), which is
+     *    harmless: respond() rechecks validity under lock for the
+     *    deferred path, and reinit_req handles a zeroed auth session
+     *    for the synchronous path.
+     *  - &shared_auth_sess is a stable address (static array member).
+     *  - pjsua_var.mod.id is immutable after pjsua_init().
+     */
+    if (!pjsua_acc_is_valid(acc_id)) {
+        return PJ_FALSE;
+    }
+
+    /* Determine call_id from rdata -> dialog -> mod_data */
+    if (param->rdata) {
+        pjsip_dialog *dlg = pjsip_rdata_get_dlg(
+                                        (pjsip_rx_data*)param->rdata);
+        if (dlg) {
+            pjsua_call *call =
+                (pjsua_call*)dlg->mod_data[pjsua_var.mod.id];
+            if (call)
+                call_id = call->index;
+        }
+    }
+
+    pj_bzero(&cb_param, sizeof(cb_param));
+    cb_param.acc_id    = acc_id;
+    cb_param.call_id   = call_id;
+    /* Always use the shared auth session (account-level lifetime) instead
+     * of the potentially short-lived module-owned session (e.g. regc's).
+     * The shared session has the same credentials and survives regc
+     * destroy/recreate cycles.
+     */
+    cb_param.auth_sess = &pjsua_var.acc[acc_id].shared_auth_sess;
+    cb_param.token     = token;
+    cb_param.rdata     = param->rdata;
+    cb_param.tdata     = param->tdata;
+
+    (*pjsua_var.ua_cfg.cb.on_auth_challenge)(&cb_param);
+
+    return cb_param.handled;
+}
+
 /*
  * Get number of current accounts.
  */
@@ -331,6 +396,15 @@ static pj_status_t initialize_acc(unsigned acc_id)
     }
     pjsip_auth_clt_init( &acc->shared_auth_sess, pjsua_var.endpt, acc->pool, 0);
 
+    /* Configure async auth if pjsua callback is set */
+    if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+        pjsip_auth_clt_async_configure(&acc->shared_auth_sess, &async_opt);
+    }
+
     if (sip_reg_uri) {
         acc->srv_port = sip_reg_uri->port;
     }
@@ -377,11 +451,21 @@ static pj_status_t initialize_acc(unsigned acc_id)
     for (i=0; i<acc_cfg->cred_count; ++i) {
         acc->cred[acc->cred_cnt++] = acc_cfg->cred_info[i];
     }
-    for (i=0; i<pjsua_var.ua_cfg.cred_count && 
+    for (i=0; i<pjsua_var.ua_cfg.cred_count &&
               acc->cred_cnt < PJ_ARRAY_SIZE(acc->cred); ++i)
     {
         acc->cred[acc->cred_cnt++] = pjsua_var.ua_cfg.cred_info[i];
     }
+
+    /* Set credentials and preference on shared auth session so it can
+     * generate Authorization headers when used by the on_auth_challenge
+     * bridge.
+     */
+    if (acc->cred_cnt) {
+        pjsip_auth_clt_set_credentials(&acc->shared_auth_sess,
+                                        acc->cred_cnt, acc->cred);
+    }
+    pjsip_auth_clt_set_prefs(&acc->shared_auth_sess, &acc->cfg.auth_pref);
 
     /* If account's ICE and TURN customization is not set, then
      * initialize it with the settings from the global media config.
@@ -663,7 +747,23 @@ PJ_DEF(void*) pjsua_acc_get_user_data(pjsua_acc_id acc_id)
 /*
  * Delete account.
  */
+PJ_DEF(void) pjsua_acc_del_param_default(pjsua_acc_del_param *prm)
+{
+    pj_bzero(prm, sizeof(*prm));
+}
+
+
 PJ_DEF(pj_status_t) pjsua_acc_del(pjsua_acc_id acc_id)
+{
+    pjsua_acc_del_param prm;
+    pjsua_acc_del_param_default(&prm);
+    prm.force = PJ_TRUE;
+    return pjsua_acc_del2(acc_id, &prm);
+}
+
+
+PJ_DEF(pj_status_t) pjsua_acc_del2(pjsua_acc_id acc_id,
+                                    const pjsua_acc_del_param *prm)
 {
     pjsua_acc *acc;
     unsigned i;
@@ -678,6 +778,27 @@ PJ_DEF(pj_status_t) pjsua_acc_del(pjsua_acc_id acc_id)
     PJSUA_LOCK();
 
     acc = &pjsua_var.acc[acc_id];
+
+    /* Check for active calls using this account */
+    for (i = 0; i < pjsua_var.ua_cfg.max_calls; ++i) {
+        if (pjsua_var.calls[i].acc_id == acc_id &&
+            (pjsua_var.calls[i].inv != NULL ||
+             pjsua_var.calls[i].async_call.dlg != NULL))
+        {
+            if (!prm->force) {
+                PJ_LOG(2, (THIS_FILE,
+                           "Unable to delete account %d: call %d still "
+                           "exists", acc_id, i));
+                PJSUA_UNLOCK();
+                pj_log_pop_indent();
+                return PJ_EBUSY;
+            }
+            PJ_LOG(2, (THIS_FILE,
+                       "Warning: deleting account %d while call %d is "
+                       "still active (forced)", acc_id, i));
+            break;
+        }
+    }
 
     for (i = 0; i < PJ_ARRAY_SIZE(pjsua_var.buddy); ++i) {
         pjsua_buddy *b = &pjsua_var.buddy[i];
@@ -743,8 +864,8 @@ PJ_DEF(pj_status_t) pjsua_acc_del(pjsua_acc_id acc_id)
         --pjsua_var.acc_cnt;
     }
 
-    /* Leave the calls intact, as I don't think calls need to
-     * access account once it's created
+    /* Ideally calls using this account should have been terminated
+     * before calling this function, unless force deletion is used.
      */
 
     /* Update default account */
@@ -1287,16 +1408,21 @@ PJ_DEF(pj_status_t) pjsua_acc_modify( pjsua_acc_id acc_id,
             update_reg = PJ_TRUE;
             unreg_first = PJ_TRUE;
         }
+
+        /* Propagate updated credentials to shared auth session */
+        pjsip_auth_clt_set_credentials(&acc->shared_auth_sess,
+                                        acc->cred_cnt, acc->cred);
     }
 
     /* Authentication preference */
     acc->cfg.auth_pref.initial_auth = cfg->auth_pref.initial_auth;
     if (pj_strcmp(&acc->cfg.auth_pref.algorithm, &cfg->auth_pref.algorithm)) {
-        pj_strdup_with_null(acc->pool, &acc->cfg.auth_pref.algorithm, 
+        pj_strdup_with_null(acc->pool, &acc->cfg.auth_pref.algorithm,
                             &cfg->auth_pref.algorithm);
         update_reg = PJ_TRUE;
         unreg_first = PJ_TRUE;
     }
+    pjsip_auth_clt_set_prefs(&acc->shared_auth_sess, &acc->cfg.auth_pref);
 
     /* Shared authentication session */
     acc->cfg.use_shared_auth = cfg->use_shared_auth;
@@ -1403,6 +1529,9 @@ PJ_DEF(pj_status_t) pjsua_acc_modify( pjsua_acc_id acc_id,
         acc->next_rtp_port = 0;
     }
 
+    /* Text settings. */
+    acc->cfg.txt_red_level = cfg->txt_red_level;
+
     if (pj_stricmp(&acc->cfg.rtp_cfg.public_addr, &cfg->rtp_cfg.public_addr) ||
         pj_stricmp(&acc->cfg.rtp_cfg.bound_addr, &cfg->rtp_cfg.bound_addr))
     {
@@ -1470,8 +1599,8 @@ PJ_DEF(pj_status_t) pjsua_acc_modify( pjsua_acc_id acc_id,
     acc->cfg.call_hold_type = cfg->call_hold_type;
 
     /* Unregister first */
-    if (unreg_first && !cfg->disable_reg_on_modify) {
-        if (acc->regc) {
+    if (unreg_first) {
+        if (acc->regc && !cfg->disable_reg_on_modify) {
             status = pjsua_acc_set_registration(acc->index, PJ_FALSE);
             if (status != PJ_SUCCESS) {
                 pjsua_perror(THIS_FILE, "Ignored failure in unregistering the "
@@ -1814,6 +1943,8 @@ static pj_bool_t acc_check_nat_addr(pjsua_acc *acc,
     pjsip_contact_hdr *contact_hdr;
     char host_addr_buf[PJ_INET6_ADDRSTRLEN+10];
     char via_addr_buf[PJ_INET6_ADDRSTRLEN+10];
+    pj_str_t recv_addr_str;
+    char recv_addr_buf[PJ_INET6_ADDRSTRLEN+10];
     const pj_str_t STR_CONTACT = { "Contact", 7 };
 
     tp = param->rdata->tp_info.transport;
@@ -1835,6 +1966,18 @@ static pj_bool_t acc_check_nat_addr(pjsua_acc *acc,
         via_addr = &via->recvd_param;
     else
         via_addr = &via->sent_by.host;
+
+    status = pj_sockaddr_parse(pj_AF_UNSPEC(), 0, via_addr, 
+                               &recv_addr);
+    /* Even though against the RFC, some registrars may put port number in
+     * via received param. Just ignore the port.
+     */
+    if (status == PJ_SUCCESS && pj_sockaddr_get_port(&recv_addr) != 0) {
+        pj_sockaddr_set_port(&recv_addr, 0);
+        pj_sockaddr_print(&recv_addr, recv_addr_buf, sizeof(recv_addr_buf), 0);
+        recv_addr_str = pj_str(recv_addr_buf);
+        via_addr = &recv_addr_str;
+    }
 
     /* If allow_via_rewrite is enabled, we save the Via "received" address
      * from the response, if either of the following condition is met:
@@ -1918,10 +2061,7 @@ static pj_bool_t acc_check_nat_addr(pjsua_acc *acc,
      */
     status = pj_sockaddr_parse(pj_AF_UNSPEC(), 0, &uri->host, 
                                &contact_addr);
-    if (status == PJ_SUCCESS)
-        status = pj_sockaddr_parse(pj_AF_UNSPEC(), 0, via_addr, 
-                                   &recv_addr);
-    if (status == PJ_SUCCESS) {
+    if (status == PJ_SUCCESS && pj_sockaddr_has_addr(&recv_addr)) {
         /* Compare the addresses as sockaddr according to the ticket above,
          * but only if they have the same family (ipv4 vs ipv4, or
          * ipv6 vs ipv6).
@@ -2015,7 +2155,7 @@ static pj_bool_t acc_check_nat_addr(pjsua_acc *acc,
                  PJSIP_TRANSPORT_SECURE;
         
         /* Enclose IPv6 address in square brackets */
-        if (tp->key.type & PJSIP_TRANSPORT_IPV6) {
+        if ((tp->key.type & PJSIP_TRANSPORT_IPV6) && via_addr->ptr[0] != '[') {
             beginquote = "[";
             endquote = "]";
         } else {
@@ -2786,6 +2926,18 @@ static pj_status_t pjsua_regc_init(int acc_id)
                          status);
             goto on_return;
         }
+    }
+
+    /* Configure async auth on non-shared regc auth session */
+    if (!acc->cfg.use_shared_auth &&
+        pjsua_var.ua_cfg.cb.on_auth_challenge)
+    {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+        pjsip_auth_clt_async_configure(
+            pjsip_regc_get_auth_sess(acc->regc), &async_opt);
     }
 
     /* Set delay before registration refresh */
@@ -3568,6 +3720,10 @@ static int get_ip_addr_ver(const pj_str_t *host)
     pj_in_addr dummy;
     pj_in6_addr dummy6;
 
+    /* Check for empty address */
+    if (host->slen == 0)
+        return 0;
+
     /* First check if this is an IPv4 address */
     if (pj_inet_pton(pj_AF_INET(), host, &dummy) == PJ_SUCCESS)
         return 4;
@@ -3678,6 +3834,10 @@ pj_status_t pjsua_acc_get_uac_addr(pjsua_acc_id acc_id,
     addr->host = tfla2_prm.ret_addr;
     addr->port = tfla2_prm.ret_port;
 
+    if (pj_strchr(&addr->host, ':')) {
+        tp_type |= PJSIP_TRANSPORT_IPV6;
+    }
+
     /* If we are behind NAT64, use the Contact and Via address from
      * the UDP6 transport, which should be obtained from STUN.
      */
@@ -3692,6 +3852,9 @@ pj_status_t pjsua_acc_get_uac_addr(pjsua_acc_id acc_id,
         if (status == PJ_SUCCESS) {
             update_addr = PJ_FALSE;
             addr->host = tfla2_prm2.ret_addr;
+            if (pj_strchr(&addr->host, ':')) {
+                tp_type |= PJSIP_TRANSPORT_IPV6;
+            }
             pj_strdup(acc->pool, &acc->via_addr.host, &addr->host);
             acc->via_addr.port = addr->port;
             acc->via_tp = (pjsip_transport *)tfla2_prm.ret_tp;
@@ -3712,6 +3875,9 @@ pj_status_t pjsua_acc_get_uac_addr(pjsua_acc_id acc_id,
                               &pjsua_var.tpdata[i].data.tp->local_name.host);
                     addr->port = (pj_uint16_t)
                                  pjsua_var.tpdata[i].data.tp->local_name.port;
+                    if (pj_strchr(&addr->host, ':')) {
+                        tp_type |= PJSIP_TRANSPORT_IPV6;
+                    }
                 }
                 break;
             }
@@ -3862,8 +4028,15 @@ pj_status_t pjsua_acc_get_uac_addr(pjsua_acc_id acc_id,
              * we are on NAT64 and already obtained the address
              * from STUN above.
              */
-            if (update_addr)
+
+            if (update_addr) {
                 pj_strdup(pool, &addr->host, &tp->local_name.host);
+                tp_type = tp->key.type;
+
+                if (pj_strchr(&addr->host, ':')) {
+                    tp_type |= PJSIP_TRANSPORT_IPV6;
+                }
+            }
             addr->port = tp->local_name.port;
         }
 
@@ -4414,6 +4587,14 @@ void pjsua_acc_on_tp_state_changed(pjsip_transport *tp,
 
             pjsip_regc_release_transport(pjsua_var.acc[i].regc);
 
+            /* Reset contact rewrite flag so that re-registration will
+             * generate a new Contact based on the new transport.
+             */
+            acc->contact_rewritten = PJ_FALSE;
+            if (acc->rfc5626_status == OUTBOUND_ACTIVE) {
+                acc->rfc5626_status = OUTBOUND_WANTED;
+            }
+
             if (pjsua_var.acc[i].ip_change_op ==
                                             PJSUA_IP_CHANGE_OP_ACC_SHUTDOWN_TP)
             {
@@ -4463,6 +4644,9 @@ pj_status_t pjsua_acc_update_contact_on_ip_change(pjsua_acc *acc)
     PJ_LOG(3, (THIS_FILE, "%.*s: send %sregistration triggered "
                "by IP change", (int)acc->cfg.id.slen,
                acc->cfg.id.ptr, (need_unreg ? "un-" : "")));
+
+    /* Prepare for contact rewrite */
+    acc->contact_rewritten = PJ_FALSE;
 
     status = pjsua_acc_set_registration(acc->index, !need_unreg);
     if ((status != PJ_SUCCESS)
@@ -4722,4 +4906,56 @@ void pjsua_acc_end_ip_change(pjsua_acc *acc)
                                             NULL);
     }
     PJSUA_UNLOCK();
+}
+
+/*
+ * Send response to incoming SIP MESSAGE request.
+ */
+PJ_DEF(pj_status_t) pjsua_acc_send_response(pjsua_acc_id acc_id,
+                                            pjsip_rx_data *rdata,
+                                            pjsip_transaction *tsx,
+                                            int st_code,
+                                            const pj_str_t *st_text,
+                                            const pjsua_msg_data *msg_data)
+{
+    pjsip_tx_data *tdata = NULL;
+    pj_status_t status;
+
+    PJ_ASSERT_RETURN(rdata != NULL, PJ_EINVAL);
+    PJ_ASSERT_RETURN(st_code >= 200 && st_code < 700, PJ_EINVAL);
+    PJ_UNUSED_ARG(acc_id);
+
+    if (!tsx) {
+        PJ_LOG(1,(THIS_FILE, "UAS transaction not found for MESSAGE response"));
+        return PJ_ENOTFOUND;
+    }
+
+    PJ_ASSERT_RETURN(tsx->role == PJSIP_ROLE_UAS, PJ_EINVAL);
+    PJ_ASSERT_RETURN(pjsip_method_cmp(&tsx->method, &pjsip_message_method) == 0,
+                     PJ_EINVAL);
+
+    status = pjsip_endpt_create_response(pjsua_var.endpt, rdata,
+                                        st_code, st_text, &tdata);
+    if (status != PJ_SUCCESS) {
+        pjsua_perror(THIS_FILE, "Unable to create response", status);
+        return status;
+    }
+
+    if (msg_data) {
+        const pjsip_hdr *hdr;
+        for (hdr = msg_data->hdr_list.next; hdr && hdr != &msg_data->hdr_list;
+             hdr=hdr->next) {
+            pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr*)pjsip_hdr_clone(
+                                                    tdata->pool, hdr));
+        }
+    }
+
+    status = pjsip_tsx_send_msg(tsx, tdata);
+    if (status != PJ_SUCCESS) {
+        pjsua_perror(THIS_FILE, "Unable to send response", status);
+        pjsip_tx_data_dec_ref(tdata);
+        return status;
+    }
+
+    return PJ_SUCCESS;
 }

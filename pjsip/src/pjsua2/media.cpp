@@ -140,7 +140,8 @@ AudioMediaTransmitParam::AudioMediaTransmitParam()
 }
 
 AudioMedia::AudioMedia() 
-: Media(PJMEDIA_TYPE_AUDIO), id(PJSUA_INVALID_ID), mediaPool(NULL)
+: Media(PJMEDIA_TYPE_AUDIO), id(PJSUA_INVALID_ID), mediaCachingPool({{{0}}}),
+  mediaPool(NULL)
 {
 }
 
@@ -420,6 +421,173 @@ void AudioMediaPort::createPort(const string &name, MediaFormatAudio &fmt)
     }
 
     registerMediaPort2(port, pool);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+static void ai_on_event_cb(pjmedia_ai_port *ai_port,
+                            const pjmedia_ai_event *event)
+{
+    pjmedia_port *port = pjmedia_ai_port_get_port(ai_port);
+    AudioMediaAiPort *amp;
+
+    /* Protect against use-after-free: check the back-pointer under
+     * grp_lock so the callback sees NULL if destructor has run.
+     */
+    if (!port || !port->grp_lock)
+        return;
+
+    pj_grp_lock_acquire(port->grp_lock);
+    amp = static_cast<AudioMediaAiPort *>(
+              pjmedia_ai_port_get_user_data(ai_port));
+    if (!amp) {
+        pj_grp_lock_release(port->grp_lock);
+        return;
+    }
+
+    {
+        AiMediaEvent ev;
+        ev.type = event->type;
+        ev.status = event->status;
+        if (event->text.slen > 0)
+            ev.text.assign(event->text.ptr, event->text.slen);
+
+        pj_grp_lock_release(port->grp_lock);
+        amp->onEvent(ev);
+    }
+}
+
+
+AudioMediaAiPort::AudioMediaAiPort()
+: pool(NULL), aiPort(NULL), backend(NULL)
+{
+}
+
+static void ai_wrapper_on_destroy(void *member)
+{
+    pj_pool_t *pool = static_cast<pj_pool_t *>(member);
+    if (pool)
+        pj_pool_release(pool);
+}
+
+AudioMediaAiPort::~AudioMediaAiPort()
+{
+    if (aiPort) {
+        /* Null the back-pointer under grp_lock so ai_on_event_cb
+         * sees NULL and bails out, preventing use-after-free.
+         */
+        pjmedia_port *port = pjmedia_ai_port_get_port(aiPort);
+        if (port && port->grp_lock) {
+            pj_grp_lock_acquire(port->grp_lock);
+            pjmedia_ai_port_set_user_data(aiPort, NULL);
+            pj_grp_lock_release(port->grp_lock);
+        }
+
+        PJSUA2_CATCH_IGNORE( disconnect() );
+    }
+
+    PJSUA2_CATCH_IGNORE( unregisterMediaPort() );
+
+    if (aiPort) {
+        pjmedia_port_destroy(pjmedia_ai_port_get_port(aiPort));
+        aiPort = NULL;
+    }
+
+    /* Note: pool is released by ai_wrapper_on_destroy() via
+     * grp_lock destroy handler, not here. This ensures the pool
+     * (which holds the backend struct) outlives the port.
+     */
+}
+
+void AudioMediaAiPort::createPort(const AiMediaPortParam &prm)
+                                   PJSUA2_THROW(Error)
+{
+    pjmedia_ai_port_param ai_param;
+    pjmedia_port *media_port;
+    pjsip_endpoint *endpt;
+    pj_status_t status;
+
+    if (pool) {
+        PJSUA2_RAISE_ERROR(PJ_EEXISTS);
+    }
+
+    pool = pjsua_pool_create("aiamp%p", 4096, 4096);
+    if (!pool) {
+        PJSUA2_RAISE_ERROR(PJ_ENOMEM);
+    }
+
+    /* Use pjsua's SIP endpoint ioqueue and timer heap so that
+     * WebSocket I/O is polled by pjsua's existing worker threads.
+     */
+    endpt = pjsua_get_pjsip_endpt();
+
+    /* Create OpenAI backend */
+    status = pjmedia_ai_openai_backend_create(pool, &backend);
+    if (status != PJ_SUCCESS) {
+        pj_pool_release(pool);
+        pool = NULL;
+        PJSUA2_RAISE_ERROR(status);
+    }
+
+    /* Create AI port */
+    pjmedia_ai_port_param_default(&ai_param);
+    ai_param.ioqueue = pjsip_endpt_get_ioqueue(endpt);
+    ai_param.timer_heap = pjsip_endpt_get_timer_heap(endpt);
+    ai_param.cb.on_event = &ai_on_event_cb;
+    ai_param.user_data = this;
+    ai_param.backend = backend;
+    ai_param.vad_enabled = prm.vadEnabled ? PJ_TRUE : PJ_FALSE;
+    ai_param.ptime_msec = prm.ptimeMsec;
+
+    status = pjmedia_ai_port_create(pool, &ai_param, &aiPort);
+    if (status != PJ_SUCCESS) {
+        pj_pool_release(pool);
+        pool = NULL;
+        PJSUA2_RAISE_ERROR(status);
+    }
+
+    media_port = pjmedia_ai_port_get_port(aiPort);
+
+    /* Register a grp_lock destroy handler so the wrapper pool (which
+     * holds the backend struct) is released only after the port's
+     * grp_lock ref-count reaches zero and all callbacks have completed.
+     */
+    pj_grp_lock_add_handler(media_port->grp_lock, pool,
+                            pool, &ai_wrapper_on_destroy);
+
+    registerMediaPort2(media_port, pool);
+}
+
+void AudioMediaAiPort::connect(const string &url, const string &authToken)
+                                PJSUA2_THROW(Error)
+{
+    pj_str_t url_str, token_str;
+    pj_status_t status;
+
+    if (!aiPort) {
+        PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
+    }
+
+    url_str = pj_str((char*)url.c_str());
+    token_str = pj_str((char*)authToken.c_str());
+
+    status = pjmedia_ai_port_connect(aiPort, &url_str, &token_str);
+    PJSUA2_CHECK_RAISE_ERROR(status);
+}
+
+void AudioMediaAiPort::disconnect() PJSUA2_THROW(Error)
+{
+    pj_status_t status;
+
+    if (!aiPort) {
+        return;
+    }
+
+    status = pjmedia_ai_port_disconnect(aiPort);
+    /* Ignore PJ_EINVALIDOP (not connected) */
+    if (status != PJ_SUCCESS && status != PJ_EINVALIDOP) {
+        PJSUA2_CHECK_RAISE_ERROR(status);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1961,6 +2129,108 @@ VidDevManager::~VidDevManager()
     clearVideoDevList();
 #endif
 }
+///////////////////////////////////////////////////////////////////////////////
+VideoPlayer::VideoPlayer()
+: playerId(PJSUA_INVALID_ID)
+{
+#if !PJSUA_HAS_VIDEO
+    PJ_UNUSED_ARG(playerId);
+#endif
+}
+
+VideoPlayer::~VideoPlayer()
+{
+#if PJSUA_HAS_VIDEO
+    if (playerId != PJSUA_INVALID_ID) {
+        pjsua_avi_player_destroy(playerId);
+    }
+#endif
+}
+
+void VideoPlayer::createVideoPlayer(const string& file_name) PJSUA2_THROW(Error)
+{
+#if PJSUA_HAS_VIDEO
+    if (playerId != PJSUA_INVALID_ID) {
+        PJSUA2_RAISE_ERROR(PJ_EEXISTS);
+    }
+    pj_str_t pj_name = str2Pj(file_name);
+
+    PJSUA2_CHECK_EXPR(pjsua_avi_player_create(&pj_name, &playerId));
+#else
+    PJ_UNUSED_ARG(file_name);
+    PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
+#endif
+}
+
+AudioMediaVector2 VideoPlayer::mediaEnumPorts() PJSUA2_THROW(Error)
+{
+#if PJSUA_HAS_VIDEO
+    AudioMediaVector2 amv2;
+    unsigned i, count;
+
+    count = pjsua_avi_player_get_num_stream(playerId, PJMEDIA_TYPE_AUDIO);
+
+    for (i = 0; i < count; ++i) {
+        AudioMediaHelper am;
+
+        pjsua_conf_port_id port_id = pjsua_avi_player_get_conf_port(playerId,
+                                                         PJMEDIA_TYPE_AUDIO, i);
+        if (port_id == PJSUA_INVALID_ID)
+            continue;
+
+        am.setPortId(port_id);
+        amv2.push_back(am);
+    }
+    if (amv2.size() == 0)
+        PJSUA2_RAISE_ERROR(PJ_ENOTFOUND);
+
+    return amv2;
+#else
+    PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
+#endif
+}
+
+VideoMediaVector VideoPlayer::mediaEnumVidPorts() PJSUA2_THROW(Error)
+{
+#if PJSUA_HAS_VIDEO
+    VideoMediaVector vmv;
+    unsigned i, count;
+
+    count = pjsua_avi_player_get_num_stream(playerId, PJMEDIA_TYPE_VIDEO);
+
+    for (i = 0; i < count; ++i) {
+        VideoMediaHelper vm;
+
+        pjsua_conf_port_id port_id = pjsua_avi_player_get_conf_port(playerId,
+                                                         PJMEDIA_TYPE_VIDEO, i);
+        if (port_id == PJSUA_INVALID_ID)
+            continue;
+
+        vm.setPortId(port_id);
+        vmv.push_back(vm);
+    }
+    if (vmv.size() == 0)
+        PJSUA2_RAISE_ERROR(PJ_ENOTFOUND);
+
+    return vmv;
+
+#else
+    PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
+#endif
+}
+
+int VideoPlayer::getVideoDevId() PJSUA2_THROW(Error)
+{
+#if PJSUA_HAS_VIDEO
+    pjmedia_vid_dev_index vid_idx = pjsua_avi_player_get_vid_dev(playerId);
+    if (vid_idx == PJMEDIA_VID_INVALID_DEV)
+        PJSUA2_RAISE_ERROR(PJ_ENOTFOUND);
+
+    return vid_idx;
+#else
+    PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
+#endif
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 VideoRecorder::VideoRecorder()
@@ -2011,6 +2281,7 @@ void VideoRecorder::createVideoRecorder(const string& file_name,
     PJ_UNUSED_ARG(vid_fmt);
     PJ_UNUSED_ARG(aud_fmt);
     PJ_UNUSED_ARG(options);
+    PJ_UNUSED_ARG(recorderId);
     PJSUA2_RAISE_ERROR(PJ_EINVALIDOP);
 #endif
 }

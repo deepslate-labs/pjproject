@@ -499,7 +499,7 @@ static pj_status_t decode_red(pjmedia_txt_stream *stream,
             return PJ_ETOOBIG;
 
         pj_memcpy(&shdr, buf, sizeof(shdr));
-        if (shdr.pt != pt) {
+        if (shdr.pt != (pj_uint8_t)pt) {
             /* Bad PT, the PT is different from the expected media PT. */
             return PJMEDIA_EINVALIDPT;
         }
@@ -622,7 +622,7 @@ static pj_status_t encode_red(unsigned level, unsigned pt,
 
         /* 1 means not final. */
         shdr.f = 1;
-        shdr.pt = (pj_uint16_t)pt;
+        shdr.pt = (pj_uint8_t)pt;
 
         /* Timestamp is an offset, not absolute. */
         offset = rbuf[rbuf_idx].timestamp - rbuf[past_idx].timestamp;
@@ -652,7 +652,7 @@ static pj_status_t encode_red(unsigned level, unsigned pt,
 
         /* Last RTP additional header, for the primary data. */
         hdr.f = 0;
-        hdr.pt = (pj_uint16_t)pt;
+        hdr.pt = (pj_uint8_t)pt;
         if (len + sizeof(hdr) > (unsigned)*size)
             return PJ_ETOOBIG;
         pj_memcpy(buf, &hdr, sizeof(hdr));
@@ -879,7 +879,7 @@ pjmedia_txt_stream_send_text(pjmedia_txt_stream *stream, const pj_str_t *text)
     pj_memcpy(stream->tx_buf[stream->tx_buf_idx].buf +
               stream->tx_buf[stream->tx_buf_idx].length,
               text->ptr, text->slen);
-    stream->tx_buf[stream->tx_buf_idx].length += text->slen;
+    stream->tx_buf[stream->tx_buf_idx].length += (unsigned)text->slen;
 
     /* Decide if we should send the text immediately or just buffer it. */
     pj_get_timestamp(&now);

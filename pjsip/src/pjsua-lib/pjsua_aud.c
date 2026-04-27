@@ -172,6 +172,37 @@ on_return:
     return status;
 }
 
+/*
+ * Get the number of queued DTMF digits for transmission in the call.
+ */
+PJ_DEF(pj_status_t) pjsua_call_get_queued_dtmf_digits(pjsua_call_id call_id,
+                                                      unsigned *digits)
+{
+    pjsua_call *call;
+    pjsip_dialog *dlg = NULL;
+    pj_status_t status;
+
+    PJ_ASSERT_RETURN(call_id>=0 && call_id<(int)pjsua_var.ua_cfg.max_calls &&
+                     digits, PJ_EINVAL);
+
+    status = acquire_call("pjsua_call_get_queued_dtmf_digits()", call_id, 
+                          &call, &dlg);
+    if (status != PJ_SUCCESS)
+        goto on_return;
+
+    if (!pjsua_call_has_media(call_id)) {
+        status = PJ_EINVALIDOP;
+        goto on_return;
+    }
+
+    *digits = pjmedia_get_queued_dtmf_digits(
+                call->media[call->audio_idx].strm.a.stream);
+
+on_return:
+    if (dlg) pjsip_dlg_dec_lock(dlg);
+    return status;
+}
+
 
 /*****************************************************************************
  *
@@ -188,6 +219,7 @@ pj_status_t pjsua_aud_subsys_init()
 #if PJMEDIA_HAS_PASSTHROUGH_CODECS
     pjmedia_format ext_fmts[32];
 #endif
+    pjmedia_conf_param param;
 
     /* To suppress warning about unused var when all codecs are disabled */
     PJ_UNUSED_ARG(codec_id);
@@ -297,14 +329,25 @@ pj_status_t pjsua_aud_subsys_init()
         opt |= PJMEDIA_CONF_USE_LINEAR;
     }
 
+    pjmedia_conf_param_default(&param);
+
+    param.max_slots = pjsua_var.media_cfg.max_media_ports;
+    param.sampling_rate = pjsua_var.media_cfg.clock_rate;
+    param.channel_count = pjsua_var.mconf_cfg.channel_count;
+    param.samples_per_frame = pjsua_var.mconf_cfg.samples_per_frame;
+    param.bits_per_sample = pjsua_var.mconf_cfg.bits_per_sample;
+    param.options = opt;
+    param.worker_threads = pjsua_var.media_cfg.conf_threads-1;
+
     /* Init conference bridge. */
-    status = pjmedia_conf_create(pjsua_var.pool,
-                                 pjsua_var.media_cfg.max_media_ports,
-                                 pjsua_var.media_cfg.clock_rate,
-                                 pjsua_var.mconf_cfg.channel_count,
-                                 pjsua_var.mconf_cfg.samples_per_frame,
-                                 pjsua_var.mconf_cfg.bits_per_sample,
-                                 opt, &pjsua_var.mconf);
+    status = pjmedia_conf_create2(pjsua_var.pool, &param, &pjsua_var.mconf);
+    //status = pjmedia_conf_create(pjsua_var.pool,
+    //                             pjsua_var.media_cfg.max_media_ports,
+    //                             pjsua_var.media_cfg.clock_rate,
+    //                             pjsua_var.mconf_cfg.channel_count,
+    //                             pjsua_var.mconf_cfg.samples_per_frame,
+    //                             pjsua_var.mconf_cfg.bits_per_sample,
+    //                             opt, &pjsua_var.mconf);
     if (status != PJ_SUCCESS) {
         pjsua_perror(THIS_FILE, "Error creating conference bridge",
                      status);
@@ -323,6 +366,12 @@ pj_status_t pjsua_aud_subsys_init()
                                       pjsua_var.mconf_cfg.bits_per_sample,
                                       &pjsua_var.null_port);
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
+
+    /* Set conf operation callback. */
+    if (pjsua_var.ua_cfg.cb.on_conf_op_completed) {
+        pjmedia_conf_set_op_cb(pjsua_var.mconf,
+                               pjsua_var.ua_cfg.cb.on_conf_op_completed);
+    }
 
     return status;
 
@@ -475,14 +524,22 @@ void pjsua_aud_stop_stream(pjsua_call_media *call_med)
             call_med->strm.a.conf_slot = PJSUA_INVALID_ID;
         }
 
-        /* Don't check for direction and transmitted packets count as we
-         * assume that RTP timestamp remains increasing when outgoing
-         * direction is disabled/paused.
+        /* Save TX seq/ts only when at least one packet was actually sent.
+         * When the stream is recreated before any packets were transmitted
+         * (e.g. media renegotiation during early dialog where the
+         * conference bridge hasn't flushed yet), saving seq=0/ts=0 forces
+         * the new stream into an invalid continuation state. Skipping the
+         * save lets pjmedia_rtp_session_init() pick a fresh random
+         * sequence number instead, which is far safer for interop with
+         * gateways that treat seq=0 as uninitialized or apply strict
+         * replay-window checks.
+         *
+         * The original guard also checked `call_med->dir & ENCODING` but
+         * that is intentionally dropped: an outgoing-paused stream may
+         * still have accumulated a valid TX sequence via clock frames.
          */
-        //if ((call_med->dir & PJMEDIA_DIR_ENCODING) &&
-        //    (pjmedia_stream_get_stat(strm, &stat) == PJ_SUCCESS) &&
-        //    stat.tx.pkt)
-        if (pjmedia_stream_get_stat(strm, &stat) == PJ_SUCCESS)
+        if (pjmedia_stream_get_stat(strm, &stat) == PJ_SUCCESS &&
+            stat.tx.pkt > 0)
         {
             /* Save RTP timestamp & sequence, so when media session is
              * restarted, those values will be restored as the initial
@@ -658,6 +715,8 @@ pj_status_t pjsua_aud_channel_update(pjsua_call_media *call_med,
             si->jb_discard_algo = prm.stream_info.info.aud.jb_discard_algo;
 #if defined(PJMEDIA_STREAM_ENABLE_KA) && (PJMEDIA_STREAM_ENABLE_KA != 0)
             si->use_ka = prm.stream_info.info.aud.use_ka;
+
+            si->ka_cfg = prm.stream_info.info.aud.ka_cfg;
 #endif
             si->rtcp_sdes_bye_disabled = prm.stream_info.info.aud.rtcp_sdes_bye_disabled;
             si->rx_event_pt = prm.stream_info.info.aud.rx_event_pt;
@@ -1139,6 +1198,11 @@ PJ_DEF(pj_status_t) pjsua_conf_get_signal_level(pjsua_conf_port_id slot,
 
     return pjmedia_conf_get_signal_level(pjsua_var.mconf, slot,
                                          tx_level, rx_level);
+}
+
+PJ_DEF(pj_status_t) pjsua_conf_set_op_cb(pjmedia_conf_op_cb cb)
+{
+    return pjmedia_conf_set_op_cb(pjsua_var.mconf, cb);
 }
 
 /*****************************************************************************
@@ -2611,6 +2675,10 @@ PJ_DEF(pj_status_t) pjsua_ext_snd_dev_create( pjmedia_snd_port_param *param,
     if (status != PJ_SUCCESS)
         goto on_return;
 
+    /* Subscribe to audio device events */
+    pjmedia_event_subscribe(NULL, &on_media_event, NULL,
+                           pjmedia_snd_port_get_snd_stream(snd->snd_port));
+
     /* Finally */
     *p_snd = snd;
     PJ_LOG(4,(THIS_FILE, "Extra sound device created"));
@@ -2640,6 +2708,14 @@ PJ_DEF(pj_status_t) pjsua_ext_snd_dev_destroy(pjsua_ext_snd_dev *snd)
 
     /* Destroy all components */
     if (snd->snd_port) {
+        pjmedia_aud_stream *strm;
+        
+        /* Unsubscribe from audio device events */
+        strm = pjmedia_snd_port_get_snd_stream(snd->snd_port);
+        if (strm) {
+            pjmedia_event_unsubscribe(NULL, &on_media_event, NULL, strm);
+        }
+        
         pjmedia_snd_port_disconnect(snd->snd_port);
         pjmedia_snd_port_destroy(snd->snd_port);
         snd->snd_port = NULL;

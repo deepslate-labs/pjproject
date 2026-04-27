@@ -269,12 +269,6 @@ static void send_mgr_on_destroy(void *arg)
 {
     send_manager* mgr = (send_manager*)arg;
 
-    if (mgr->thread) {
-        mgr->is_quitting = PJ_TRUE;
-        pj_thread_join(mgr->thread);
-        pj_thread_destroy(mgr->thread);
-    }
-
     if (mgr->pool)
         pj_pool_safe_release(&mgr->pool);
 }
@@ -285,11 +279,10 @@ static void send_mgr_on_destroy(void *arg)
 static pj_status_t attach_send_manager(send_stream *ss, send_manager *mgr)
 {
     pj_status_t status = PJ_SUCCESS;
+    pj_pool_t *pool = NULL;
 
     /* Initialize manager if not yet */
     if (!mgr->pool) {
-        pj_pool_t *pool;
-
         /* Create pool */
         pool = pj_pool_create(ss->pool->factory, "stream_send_mgr",
                               1024, 1024, NULL);
@@ -306,13 +299,17 @@ static pj_status_t attach_send_manager(send_stream *ss, send_manager *mgr)
                                               &mgr->grp_lock);
         if (status != PJ_SUCCESS)
             goto on_return;
+    }
 
-        /* Create thread */
+    /* Add ref counter */
+    status = pj_grp_lock_add_ref(mgr->grp_lock);
+    if (status != PJ_SUCCESS)
+        goto on_return;
+
+    /* Create thread if manager was initialized */
+    if (pool)
         status = pj_thread_create(pool, "send_mgr", &send_worker_thread, mgr,
                                   0, 0, &mgr->thread);
-        if (status != PJ_SUCCESS)
-            goto on_return;
-    }
 
 on_return:
     if (status != PJ_SUCCESS) {
@@ -324,9 +321,7 @@ on_return:
     }
 
     ss->mgr = mgr;
-
-    /* Add ref counter */
-    return pj_grp_lock_add_ref(mgr->grp_lock);
+    return PJ_SUCCESS;
 }
 
 /* Detach send manager from stream.
@@ -358,6 +353,13 @@ static pj_status_t detach_send_manager(send_stream *ss)
     }
     ss->mgr = NULL;
     pj_grp_lock_release(mgr->grp_lock);
+
+    /* Stop send manager thread */
+    if (mgr->thread) {
+        mgr->is_quitting = PJ_TRUE;
+        pj_thread_join(mgr->thread);
+        pj_thread_destroy(mgr->thread);
+    }
 
     /* Decrease ref counter */
     return pj_grp_lock_dec_ref(mgr->grp_lock);
@@ -1925,15 +1927,15 @@ PJ_DEF(pj_status_t) pjmedia_vid_stream_create(
         send_manager *send_mgr;
         send_stream *ss;
 
-        send_mgr = PJ_POOL_ZALLOC_T(c_strm->own_pool, send_manager);
-        ss = PJ_POOL_ZALLOC_T(c_strm->own_pool, send_stream);
+        send_mgr = PJ_POOL_ZALLOC_T(pool, send_manager);
+        ss = PJ_POOL_ZALLOC_T(pool, send_stream);
         if (!send_mgr || !ss)
             goto err_cleanup;
 
         pj_list_init(&ss->free_list);
         ss->grp_lock = c_strm->grp_lock;
         ss->tp = c_strm->transport;
-        ss->pool = c_strm->own_pool;
+        ss->pool = pool;
         ss->buf_size = c_strm->enc->buf_size;
         ss->ts_freq = stream->ts_freq;
         ss->rc_bandwidth = stream->info.rc_cfg.bandwidth;

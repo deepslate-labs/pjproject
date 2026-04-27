@@ -23,7 +23,9 @@
  * @file pjmedia.h
  * @brief PJMEDIA main header file.
  */
+#include <pjmedia/ai_port.h>
 #include <pjmedia/alaw_ulaw.h>
+#include <pjmedia/avi.h>
 #include <pjmedia/avi_stream.h>
 #include <pjmedia/bidirectional.h>
 #include <pjmedia/circbuf.h>

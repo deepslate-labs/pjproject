@@ -11,6 +11,12 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\src\pjmedia\ai_port.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\pjmedia\ai_port_openai.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\pjmedia\alaw_ulaw.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -36,6 +42,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\pjmedia\conference.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\pjmedia\conf_thread.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\pjmedia\converter.c">
@@ -239,8 +248,14 @@
     <ClCompile Include="..\src\pjmedia\av_sync.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\pjmedia\stream_imp_common.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\include\pjmedia\ai_port.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\include\pjmedia\alaw_ulaw.h">
       <Filter>Header Files</Filter>
     </ClInclude>

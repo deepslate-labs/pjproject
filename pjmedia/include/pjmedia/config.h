@@ -120,6 +120,64 @@
 #   define PJMEDIA_CONF_USE_AGC             1
 #endif
 
+/**
+ * Conference switch/bridge backend implementations.
+ * Select one of these implementations in PJMEDIA_CONF_BACKEND.
+ */
+/** Conference switch board backend */
+#define PJMEDIA_CONF_SWITCH_BOARD_BACKEND 0
+/** Conference bridge sequential backend */
+#define PJMEDIA_CONF_SERIAL_BRIDGE_BACKEND 1
+/** Multithreaded conference bridge backend */
+#define PJMEDIA_CONF_PARALLEL_BRIDGE_BACKEND 2
+
+/**
+ * Choose which conference backend implementation to use.
+ * 
+ * In order to use parallel conference bridge with real parallelism,
+ * users need to:
+ * 1. define PJMEDIA_CONF_BACKEND to PJMEDIA_CONF_PARALLEL_BRIDGE_BACKEND
+ * and at least one of the following:
+ * 2.1. define PJMEDIA_CONF_THREADS with a value > 1
+ *   This option allows pjmedia_conf_create() to create a parallel conference
+ *   and so convert any existing serial conference to parallel conference 
+ *   without changing the code.
+ * OR
+ * 2.2. use pjmedia_conf_create2() with pjmedia_conf_param::worker_threads
+ * initialized to a value > 0.
+ *
+ * Default is PJMEDIA_CONF_SERIAL_BRIDGE_BACKEND, 
+ * however 
+ * if PJMEDIA_CONF_USE_SWITCH_BOARD macro was defined, project system
+ *   selects PJMEDIA_CONF_SWITCH_BOARD_BACKEND by default,
+ * otherwise if PJMEDIA_CONF_THREADS macro was defined, project system 
+ *   selects PJMEDIA_CONF_PARALLEL_BRIDGE_BACKEND by default.
+ */
+#ifndef PJMEDIA_CONF_BACKEND
+#   if defined(PJMEDIA_CONF_USE_SWITCH_BOARD) && PJMEDIA_CONF_USE_SWITCH_BOARD!=0
+#       define PJMEDIA_CONF_BACKEND PJMEDIA_CONF_SWITCH_BOARD_BACKEND
+#   elif defined(PJMEDIA_CONF_THREADS)
+#       define PJMEDIA_CONF_BACKEND PJMEDIA_CONF_PARALLEL_BRIDGE_BACKEND
+#   else
+#       define PJMEDIA_CONF_BACKEND PJMEDIA_CONF_SERIAL_BRIDGE_BACKEND
+#   endif 
+#endif  //PJMEDIA_CONF_BACKEND
+
+ /**
+ * The default value for the total number of threads, including get_frame()
+ * thread, that can be used by the conference bridge.
+ * This value is used to determine if the conference bridge should be
+ * implemented as a parallel bridge or not.
+ * If this value is set to 1, the conference bridge will be implemented as a
+ * serial bridge, otherwise it will be implemented as a parallel bridge.
+ * PJMEDIA_CONF_THREADS should not be less than 1.
+ *
+ * Default value: 1 - serial bridge
+ */
+#ifndef PJMEDIA_CONF_THREADS
+#   define PJMEDIA_CONF_THREADS  1
+#endif
+
 
 /*
  * Types of sound stream backends.
@@ -681,12 +739,32 @@
 
 
 /**
- * Suggested or default threshold to be set for fixed silence detection
- * or as starting threshold for adaptive silence detection. The threshold
- * has the range from zero to 0xFFFF.
+ * Default starting threshold for adaptive silence detection, or the
+ * threshold for fixed silence detection. The threshold has the range
+ * from zero to 0xFFFF. Signal levels below this value are considered
+ * silence. Typical speech produces levels of 50-600, while a quiet room
+ * has levels near 0.
+ *
+ * Default: 20
  */
 #ifndef PJMEDIA_SILENCE_DET_THRESHOLD
-#   define PJMEDIA_SILENCE_DET_THRESHOLD        4
+#   define PJMEDIA_SILENCE_DET_THRESHOLD        20
+#endif
+
+
+/**
+ * Minimum adaptive threshold for the silence detector. When adaptive
+ * mode recalculates the threshold based on the noise floor, it will
+ * never drop below this value. This prevents the threshold from
+ * collapsing to 0 in very quiet environments, which would cause any
+ * signal (even electrical noise at level 1) to be classified as speech.
+ *
+ * Set to 0 to disable (not recommended).
+ *
+ * Default: 20
+ */
+#ifndef PJMEDIA_SILENCE_DET_MIN_THRESHOLD
+#   define PJMEDIA_SILENCE_DET_MIN_THRESHOLD    20
 #endif
 
 
@@ -1208,6 +1286,17 @@
  */
 #ifndef PJMEDIA_SRTP_HAS_AES_GCM_128
 #   define PJMEDIA_SRTP_HAS_AES_GCM_128             0
+#endif
+
+
+/**
+ * Specify whether SRTP needs to handle condition that remote changes SSRC
+ * when SRTP is restarted.
+ *
+ * Default: enabled.
+ */
+#ifndef PJMEDIA_SRTP_CHECK_SSRC_ON_RESTART
+#   define PJMEDIA_SRTP_CHECK_SSRC_ON_RESTART    1
 #endif
 
 

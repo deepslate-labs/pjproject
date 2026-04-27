@@ -337,7 +337,28 @@ PJ_DECL(pj_status_t) pjmedia_stream_resume(pjmedia_stream *stream,
                                            pjmedia_dir dir);
 
 /**
- * Transmit DTMF to this stream. The DTMF will be transmitted uisng
+ * Set DTMF transmission options of this stream.
+ *
+ * @param stream        The media stream.
+ * @param duration_ms   Event duration in milliseconds (0..1000).
+ * @param pause_ms      Pause between events in milliseconds (0..1000).
+ * @param pt            Payload type to use.
+ * @param vol           Volume to use (-63..0).
+ * @param ebit_rep_cnt  Number of additional packet repetitions of the end bit
+ *                      (0..7).
+ *
+ * @return              PJ_SUCCESS on success.
+ */
+PJ_DECL(pj_status_t)
+pjmedia_stream_set_tx_dtmf_options(pjmedia_stream *stream,
+                                   pj_uint32_t duration_ms,
+                                   pj_uint32_t pause_ms,
+                                   pj_uint8_t pt,
+                                   pj_int8_t vol,
+                                   pj_uint32_t ebit_rep_cnt);
+
+/**
+ * Transmit DTMF to this stream. The DTMF will be transmitted using
  * RTP telephone-events as described in RFC 2833. This operation is
  * only valid for audio stream.
  *
@@ -451,6 +472,17 @@ pjmedia_stream_set_dtmf_event_callback(pjmedia_stream *stream,
                                                   void *user_data,
                                                   const pjmedia_stream_dtmf_event *event),
                                        void *user_data);
+
+
+/**
+ * Get the number of queued DTMF digits for transmission.
+ *
+ * @param stream        The media stream.
+ *
+ * @return              Number of DTMF digits queued for transmission,
+ *                      or 0 if stream is NULL.
+ */
+PJ_DECL(unsigned) pjmedia_get_queued_dtmf_digits(pjmedia_stream *stream);
 
 
 /**

@@ -778,6 +778,7 @@ static pj_status_t process_m_answer( pj_pool_t *pool,
                                      pj_bool_t allow_asym)
 {
     unsigned i;
+    pj_bool_t is_audio;
 
     /* Check that the media type match our offer. */
 
@@ -785,6 +786,8 @@ static pj_status_t process_m_answer( pj_pool_t *pool,
         /* The media type in the answer is different than the offer! */
         return PJMEDIA_SDPNEG_EINVANSMEDIA;
     }
+
+    is_audio = (pj_strcmp2(&offer->desc.media, "audio") == 0);
 
     /* Check if remote has rejected our offer */
     if (answer->desc.port == 0) {
@@ -886,6 +889,10 @@ static pj_status_t process_m_answer( pj_pool_t *pool,
                 }
                 pjmedia_sdp_attr_get_rtpmap(a, &or_);
 
+                /* For audio, channel count is 1 if not specified */
+                if (is_audio && or_.param.slen == 0)
+                    or_.param = pj_str("1");
+
                 /* Find paylaod in answer SDP with matching 
                  * encoding name and clock rate.
                  */
@@ -896,13 +903,16 @@ static pj_status_t process_m_answer( pj_pool_t *pool,
                         pjmedia_sdp_rtpmap ar;
                         pjmedia_sdp_attr_get_rtpmap(a, &ar);
 
+                        /* For audio, channel count is 1 if not specified */
+                        if (is_audio && ar.param.slen == 0)
+                            ar.param = pj_str("1");
+
                         /* See if encoding name, clock rate, and channel
                          * count match 
                          */
                         if (!pj_stricmp(&or_.enc_name, &ar.enc_name) &&
                             or_.clock_rate == ar.clock_rate &&
-                            (pj_stricmp(&or_.param, &ar.param)==0 ||
-                             (ar.param.slen==1 && *ar.param.ptr=='1')))
+                            (pj_stricmp(&or_.param, &ar.param)==0))
                         {
                             /* Call custom format matching callbacks */
                             if (custom_fmt_match(pool, &or_.enc_name,
@@ -1142,6 +1152,7 @@ static void apply_answer_symmetric_pt(pj_pool_t *pool,
      */
     for (i = 0; i < pt_cnt; ++i) {
         pjmedia_sdp_attr *a;
+        pj_bool_t is_red = PJ_FALSE;
 
         /* Skip if the PTs are the same already, e.g: static PT. */
         if (pj_strcmp(&pt_answer[i], &pt_offer[i]) == 0)
@@ -1153,18 +1164,70 @@ static void apply_answer_symmetric_pt(pj_pool_t *pool,
         /* Also update payload type in rtpmap */
         a = pjmedia_sdp_media_find_attr2(answer, "rtpmap", &pt_answer[i]);
         if (a) {
+            pjmedia_sdp_rtpmap r;
+
             rewrite_pt(pool, &a->value, &pt_answer[i], &pt_offer[i]);
             /* Temporarily remove the attribute in case the new payload
              * type is being used by another format in the media.
              */
             pjmedia_sdp_media_remove_attr(answer, a);
             a_tmp[a_tmp_cnt++] = a;
+
+            pjmedia_sdp_attr_get_rtpmap(a, &r);
+            if (!pj_stricmp2(&r.enc_name, "red")) {
+                is_red = PJ_TRUE;
+            }
         }
 
         /* Also update payload type in fmtp */
         a = pjmedia_sdp_media_find_attr2(answer, "fmtp", &pt_answer[i]);
         if (a) {
-            rewrite_pt(pool, &a->value, &pt_answer[i], &pt_offer[i]);
+            if (is_red) {
+                enum { MAX_FMTP_STR_LEN = 32 };
+                pjmedia_codec_fmtp fmtp;
+                pj_status_t status;
+                unsigned pt_o=0, pt_a=0, buf_len=0;
+                char buf[MAX_FMTP_STR_LEN];
+
+                pt_o = pj_strtoul(&pt_offer[i]);
+                pt_a = pj_strtoul(&pt_answer[i]);
+                buf_len = pj_ansi_snprintf(buf, MAX_FMTP_STR_LEN, "%d ", pt_o);
+                status = pjmedia_stream_info_parse_fmtp(pool, answer, pt_a, 
+                                                        &fmtp);
+
+                if (status == PJ_SUCCESS) {
+                    unsigned len = 0;
+                    unsigned j, k;
+                    pj_str_t new_fmtp;
+
+                    /* Update the fmtp redundancy PT. */
+                    for (j = 0; j < fmtp.cnt; ++j) {
+                        pt_o = pj_strtoul(&fmtp.param[j].val);
+                        for (k = 0; k < pt_cnt ;++k) {
+                            if (!pj_stricmp(&fmtp.param[j].val, &pt_answer[k])){
+                                pt_o = pj_strtoul(&pt_offer[k]);
+                                break;
+                            }
+                        }
+                        len = pj_ansi_snprintf(buf + buf_len,
+                                               MAX_FMTP_STR_LEN - buf_len,
+                                               (j==0)?"%d":"/%d", pt_o);
+
+                        if (len >= MAX_FMTP_STR_LEN - buf_len) {
+                            /* Truncation occurred, stop processing further. */
+                            buf_len = MAX_FMTP_STR_LEN;
+                            break;
+                        } else {
+                            buf_len += len;
+                        }
+                    }
+                    new_fmtp.ptr = buf;
+                    new_fmtp.slen = buf_len;
+                    rewrite_pt(pool, &a->value, &a->value, &new_fmtp);
+                }
+            } else {
+                rewrite_pt(pool, &a->value, &pt_answer[i], &pt_offer[i]);
+            }
             /* Temporarily remove the attribute in case the new payload
              * type is being used by another format in the media.
              */
@@ -1788,8 +1851,6 @@ static pj_status_t assign_pt_and_update_map(pj_pool_t *pool,
 {
     unsigned i, j;
 
-    PJ_UNUSED_ARG(pool);
-
     for (i = 0; i < sess->media_count; ++i) {
         pjmedia_type med_type;
         unsigned count;
@@ -1931,7 +1992,7 @@ static pj_status_t assign_pt_and_update_map(pj_pool_t *pool,
             }
 
             if (new_pt != 0 && new_pt != (pj_int8_t)pt) {
-                rewrite_pt2(neg->pool_active, (pj_str_t *)&attr->value,
+                rewrite_pt2(pool, (pj_str_t *)&attr->value,
                             pt, new_pt);
             } else {
                 new_pt = (pj_int8_t)pt;
@@ -1976,7 +2037,7 @@ static pj_status_t assign_pt_and_update_map(pj_pool_t *pool,
             if (new_pt == 0 || new_pt == pt)
                 continue;
 
-            rewrite_pt2(neg->pool_active, (pj_str_t *)&attr->value,
+            rewrite_pt2(pool, (pj_str_t *)&attr->value,
                         pt, new_pt);
         }
 
@@ -1993,7 +2054,7 @@ static pj_status_t assign_pt_and_update_map(pj_pool_t *pool,
             if (new_pt == 0 || new_pt == pt)
                 continue;
 
-            rewrite_pt2(neg->pool_active, &sdp_m->desc.fmt[j],
+            rewrite_pt2(pool, &sdp_m->desc.fmt[j],
                         pt, new_pt);
         }
     }

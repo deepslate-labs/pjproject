@@ -66,6 +66,8 @@ void flush_events(unsigned duration)
         if (PJ_TIME_VAL_GTE(now, stop_time))
             break;
     }
+
+    pjsip_endpt_stop_handle_events(endpt);
 }
 
 /* Wait until there is no loop transport instance */
@@ -346,9 +348,9 @@ int test_main(int argc, char *argv[])
     pj_assert(tsx_test[0].type == PJSIP_TRANSPORT_LOOP_DGRAM);
 
     for (i = 0; i < tsx_test_cnt; ++i) {
-        UT_ADD_TEST1(&test_app.ut_app, tsx_basic_test, (void*)(long)i, 0);
-        UT_ADD_TEST1(&test_app.ut_app, tsx_uac_test, (void*)(long)i, 0);
-        UT_ADD_TEST1(&test_app.ut_app, tsx_uas_test, (void*)(long)i, 0);
+        UT_ADD_TEST1(&test_app.ut_app, tsx_basic_test, (void*)(uintptr_t)i, 0);
+        UT_ADD_TEST1(&test_app.ut_app, tsx_uac_test, (void*)(uintptr_t)i, 0);
+        UT_ADD_TEST1(&test_app.ut_app, tsx_uas_test, (void*)(uintptr_t)i, 0);
     }
 #endif
 
@@ -372,6 +374,16 @@ int test_main(int argc, char *argv[])
      */
 #if INCLUDE_REGC_TEST
     UT_ADD_TEST(&test_app.ut_app, regc_test, PJ_TEST_EXCLUSIVE | PJ_TEST_KEEP_LAST);
+#endif
+
+#if INCLUDE_AUTH_ASYNC_TEST
+    UT_ADD_TEST(&test_app.ut_app, auth_async_test,
+                PJ_TEST_EXCLUSIVE | PJ_TEST_KEEP_LAST);
+#endif
+
+#if INCLUDE_PJSUA_AUTH_TEST
+    UT_ADD_TEST(&test_app.ut_app, pjsua_auth_test,
+                PJ_TEST_EXCLUSIVE | PJ_TEST_KEEP_LAST);
 #endif
 
     /* This needs to be exclusive, because there must NOT be any other

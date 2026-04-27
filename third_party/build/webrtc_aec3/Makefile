@@ -11,7 +11,7 @@ export WEBRTC_AEC3_LIB := libwebrtc-aec3-$(TARGET_NAME)$(LIBEXT)
 ifeq ($(PJ_SHARED_LIBRARIES),)
 else
 export WEBRTC_AEC3_SONAME := libwebrtc-aec3.$(SHLIB_SUFFIX)
-export WEBRTC_AEC3_SHLIB := $(WEBRTC_AEC3_SONAME).$(PJ_VERSION_MAJOR)
+export WEBRTC_AEC3_SHLIB := $(WEBRTC_AEC3_SONAME).$(PJ_SONAME_VERSION)
 endif
 
 ###############################################################################
@@ -167,7 +167,7 @@ export WEBRTC_AEC3_OBJS = \
 	$(WEBRTC_AEC3_SRC)
 
 export WEBRTC_AEC3_CFLAGS = $(_CFLAGS) $(WEBRTC_AEC3_OTHER_CFLAGS)
-export WEBRTC_AEC3_CXXFLAGS = $(WEBRTC_AEC3_CFLAGS) $(_CXXFLAGS)
+export WEBRTC_AEC3_CXXFLAGS = $(_CXXFLAGS) $(WEBRTC_AEC3_CFLAGS)
 export WEBRTC_AEC3_LDFLAGS = $(_LDFLAGS)
 
 

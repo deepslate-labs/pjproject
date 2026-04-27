@@ -23,6 +23,7 @@
  * @brief PJSUA2 Call manipulation
  */
 #include <pjsua-lib/pjsua.h>
+#include <pjsua2/account.hpp>
 #include <pjsua2/media.hpp>
 
 /** PJSUA2 API is inside pj namespace */
@@ -689,6 +690,21 @@ struct StreamInfo
      * enabled?
      */
     bool                useKa;
+
+    /**
+     *  Number of keepalive messages to be sent
+     */
+    unsigned            startCountKa;
+
+    /**
+     * Keepalive interval after the stream is created.
+     */
+    unsigned startIntervalKa;
+
+    /**
+     *  Keepalive sending interval.
+     */
+    unsigned intervalKa;
 #endif
 
     /**
@@ -2003,8 +2019,8 @@ public:
      * (as opposed to onStreamCreated(), which is called *after* the session
      * has been created). The application may change
      * some stream info parameter values, i.e: jbInit, jbMinPre, jbMaxPre,
-     * jbMax, useKa, rtcpSdesByeDisabled, jbDiscardAlgo (audio),
-     * vidCodecParam.encFmt (video).
+     * jbMax, useKa, startCountKa, startIntervalKa, intervalKa,
+     * rtcpSdesByeDisabled, jbDiscardAlgo (audio), vidCodecParam.encFmt (video).
      *
      * @param prm       Callback parameter.
      */
@@ -2335,11 +2351,10 @@ public:
 private:
     friend class Endpoint;
 
-    Account             &acc;
+    Account             *acc;
     pjsua_call_id        id;
     Token                userData;
     std::vector<Media *> medias;
-    pj_pool_t           *sdp_pool;
     Call                *child;     /* New outgoing call in call transfer.  */
 };
 

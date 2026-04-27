@@ -40,7 +40,6 @@
 #  include <openssl/sha.h>
 #  include <openssl/evp.h>
 #  include <openssl/md5.h>
-#  include <openssl/sha.h>
 
 #  if OPENSSL_VERSION_NUMBER < 0x10100000L
 #    define EVP_MD_CTX_new() EVP_MD_CTX_create()
@@ -48,7 +47,6 @@
 #  endif
 
 #  ifdef _MSC_VER
-#    include <openssl/opensslv.h>
 #    if OPENSSL_VERSION_NUMBER >= 0x10100000L
 #      pragma comment(lib, "libcrypto")
 #    else
@@ -76,6 +74,35 @@
 #define EVP_DigestUpdate(mdctx, data, len) MD5_APPEND(mdctx, data, len)
 #define EVP_DigestFinal_ex(mdctx, digest, _unused) pj_md5_final(mdctx, digest)
 #define EVP_MD_CTX_free(mdctx)
+#endif
+
+/*
+ * When building with OpenSSL, MD5 may not be available (e.g., FIPS-only
+ * configurations). Detect MD5 availability once and, if missing, fall back
+ * to pjlib's internal MD5 implementation for MD5-based digests.
+ */
+#if defined(PJ_HAS_SSL_SOCK) && PJ_HAS_SSL_SOCK != 0 && \
+    PJ_SSL_SOCK_IMP==PJ_SSL_SOCK_IMP_OPENSSL
+static int g_md5_evp_supported = -1; /* -1=unknown, 0=no, 1=yes */
+static pj_bool_t md5_evp_is_supported(void)
+{
+    if (g_md5_evp_supported == -1) {
+        const EVP_MD *md = EVP_get_digestbyname("MD5");
+        if (!md) {
+            g_md5_evp_supported = 0;
+        } else {
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (!ctx) {
+                g_md5_evp_supported = 0;
+            } else {
+                /* EVP_DigestInit_ex will fail in strict FIPS environments */
+                g_md5_evp_supported = (EVP_DigestInit_ex(ctx, md, NULL) == 1) ? 1 : 0;
+                EVP_MD_CTX_free(ctx);
+            }
+        }
+    }
+    return g_md5_evp_supported ? PJ_TRUE : PJ_FALSE;
+}
 #endif
 
 const pjsip_auth_algorithm pjsip_auth_algorithms[] = {
@@ -120,6 +147,18 @@ const pjsip_auth_algorithm pjsip_auth_algorithms[] = {
             return on_parent; \
         } \
     } while(0)
+
+
+/* Signature of async auth token, used to detect double-use (zeroed on
+ * consumption) and provide minimal protection against invalid token pointers.
+ *
+ * Note: the check-then-clear of the signature in send_req/abandon is not
+ * atomic, but this is safe under PJSIP's single-worker-thread model.  When
+ * a parent session lock is configured (via DO_ON_PARENT_LOCKED), the lock
+ * serializes concurrent access.
+ */
+#define AUTH_TOKEN_SIGNATURE    "AUTH"
+
 
 static void dup_bin(pj_pool_t *pool, pj_str_t *dst, const pj_str_t *src)
 {
@@ -232,6 +271,7 @@ PJ_DEF(pj_status_t) pjsip_auth_create_digest2( pj_str_t *result,
     unsigned dig_len = 0;
     const EVP_MD* md;
     DEFINE_HASH_CONTEXT;
+    pj_bool_t use_builtin_md5 = PJ_FALSE;
 
     PJ_ASSERT_RETURN(result && nonce && uri && realm && cred_info && method, PJ_EINVAL);
     pj_bzero(result->ptr, result->slen);
@@ -294,8 +334,15 @@ PJ_DEF(pj_status_t) pjsip_auth_create_digest2( pj_str_t *result,
     }
 
     md = EVP_get_digestbyname(algorithm->openssl_name);
-    if (md == NULL) {
-        /* Shouldn't happen since it was checked above */
+    /* For MD5, if OpenSSL doesn't provide/allow it, we'll fallback. */
+#if defined(PJ_HAS_SSL_SOCK) && PJ_HAS_SSL_SOCK != 0 && \
+    PJ_SSL_SOCK_IMP==PJ_SSL_SOCK_IMP_OPENSSL
+    if (algorithm->algorithm_type == PJSIP_AUTH_ALGORITHM_MD5 && !md5_evp_is_supported()) {
+        use_builtin_md5 = PJ_TRUE;
+    }
+#endif
+    if (md == NULL && !use_builtin_md5) {
+        /* Shouldn't happen since it was checked above, unless provider disabled; */
         return PJ_ENOTSUP;
     }
 
@@ -309,23 +356,33 @@ PJ_DEF(pj_status_t) pjsip_auth_create_digest2( pj_str_t *result,
         /***
          *** ha1 = (digest)(username ":" realm ":" password)
          ***/
-        mdctx = EVP_MD_CTX_new();
-
-        EVP_DigestInit_ex(mdctx, md, NULL);
-        EVP_DigestUpdate(mdctx, cred_info->username.ptr, cred_info->username.slen);
-        EVP_DigestUpdate(mdctx, ":", 1);
-        EVP_DigestUpdate(mdctx, realm->ptr, realm->slen);
-        EVP_DigestUpdate(mdctx, ":", 1);
-        EVP_DigestUpdate(mdctx, cred_info->data.ptr, cred_info->data.slen);
-
-        EVP_DigestFinal_ex(mdctx, digest, &dig_len);
-        EVP_MD_CTX_free(mdctx);
+        if (use_builtin_md5) {
+            pj_md5_context ctx;
+            pj_md5_init(&ctx);
+            pj_md5_update(&ctx, (const pj_uint8_t*)cred_info->username.ptr, (unsigned)cred_info->username.slen);
+            pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+            pj_md5_update(&ctx, (const pj_uint8_t*)realm->ptr, (unsigned)realm->slen);
+            pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+            pj_md5_update(&ctx, (const pj_uint8_t*)cred_info->data.ptr, (unsigned)cred_info->data.slen);
+            pj_md5_final(&ctx, digest);
+            dig_len = digest_len;
+        } else {
+            mdctx = EVP_MD_CTX_new();
+            EVP_DigestInit_ex(mdctx, md, NULL);
+            EVP_DigestUpdate(mdctx, cred_info->username.ptr, cred_info->username.slen);
+            EVP_DigestUpdate(mdctx, ":", 1);
+            EVP_DigestUpdate(mdctx, realm->ptr, realm->slen);
+            EVP_DigestUpdate(mdctx, ":", 1);
+            EVP_DigestUpdate(mdctx, cred_info->data.ptr, cred_info->data.slen);
+            EVP_DigestFinal_ex(mdctx, digest, &dig_len);
+            EVP_MD_CTX_free(mdctx);
+        }
         digestNtoStr(digest, dig_len, ha1);
 
     } else {
         AUTH_TRACE_((THIS_FILE, " Using pre computed digest for %.*s digest",
                 (int)algorithm->iana_name.slen, algorithm->iana_name.ptr));
-        pj_memcpy( ha1, cred_info->data.ptr, cred_info->data.slen );
+        pj_memcpy( ha1, cred_info->data.ptr, digest_strlen );
     }
 
     AUTH_TRACE_((THIS_FILE, " ha1=%.*s", algorithm->digest_str_length, ha1));
@@ -333,13 +390,23 @@ PJ_DEF(pj_status_t) pjsip_auth_create_digest2( pj_str_t *result,
     /***
      *** ha2 = (digest)(method ":" req_uri)
      ***/
-    mdctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(mdctx, md, NULL);
-    EVP_DigestUpdate(mdctx, method->ptr, method->slen);
-    EVP_DigestUpdate(mdctx, ":", 1);
-    EVP_DigestUpdate(mdctx, uri->ptr, uri->slen);
-    EVP_DigestFinal_ex(mdctx, digest, &dig_len);
-    EVP_MD_CTX_free(mdctx);
+    if (use_builtin_md5) {
+        pj_md5_context ctx;
+        pj_md5_init(&ctx);
+        pj_md5_update(&ctx, (const pj_uint8_t*)method->ptr, (unsigned)method->slen);
+        pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+        pj_md5_update(&ctx, (const pj_uint8_t*)uri->ptr, (unsigned)uri->slen);
+        pj_md5_final(&ctx, digest);
+        dig_len = digest_len;
+    } else {
+        mdctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(mdctx, md, NULL);
+        EVP_DigestUpdate(mdctx, method->ptr, method->slen);
+        EVP_DigestUpdate(mdctx, ":", 1);
+        EVP_DigestUpdate(mdctx, uri->ptr, uri->slen);
+        EVP_DigestFinal_ex(mdctx, digest, &dig_len);
+        EVP_MD_CTX_free(mdctx);
+    }
     digestNtoStr(digest, dig_len, ha2);
 
     AUTH_TRACE_((THIS_FILE, " ha2=%.*s", algorithm->digest_str_length, ha2));
@@ -351,24 +418,43 @@ PJ_DEF(pj_status_t) pjsip_auth_create_digest2( pj_str_t *result,
      *** When qop=auth is used:
      ***   response = (digest)(ha1 ":" nonce ":" nc ":" cnonce ":" qop ":" ha2)
      ***/
-    mdctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(mdctx, md, NULL);
-    EVP_DigestUpdate(mdctx, ha1, digest_strlen);
-    EVP_DigestUpdate(mdctx, ":", 1);
-    EVP_DigestUpdate(mdctx, nonce->ptr, nonce->slen);
-    if (qop && qop->slen != 0) {
+    if (use_builtin_md5) {
+        pj_md5_context ctx;
+        pj_md5_init(&ctx);
+        pj_md5_update(&ctx, (const pj_uint8_t*)ha1, (unsigned)digest_strlen);
+        pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+        pj_md5_update(&ctx, (const pj_uint8_t*)nonce->ptr, (unsigned)nonce->slen);
+        if (qop && qop->slen != 0) {
+            pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+            pj_md5_update(&ctx, (const pj_uint8_t*)nc->ptr, (unsigned)nc->slen);
+            pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+            pj_md5_update(&ctx, (const pj_uint8_t*)cnonce->ptr, (unsigned)cnonce->slen);
+            pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+            pj_md5_update(&ctx, (const pj_uint8_t*)qop->ptr, (unsigned)qop->slen);
+        }
+        pj_md5_update(&ctx, (const pj_uint8_t*)":", 1);
+        pj_md5_update(&ctx, (const pj_uint8_t*)ha2, (unsigned)digest_strlen);
+        pj_md5_final(&ctx, digest);
+        dig_len = digest_len;
+    } else {
+        mdctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(mdctx, md, NULL);
+        EVP_DigestUpdate(mdctx, ha1, digest_strlen);
         EVP_DigestUpdate(mdctx, ":", 1);
-        EVP_DigestUpdate(mdctx, nc->ptr, nc->slen);
+        EVP_DigestUpdate(mdctx, nonce->ptr, nonce->slen);
+        if (qop && qop->slen != 0) {
+            EVP_DigestUpdate(mdctx, ":", 1);
+            EVP_DigestUpdate(mdctx, nc->ptr, nc->slen);
+            EVP_DigestUpdate(mdctx, ":", 1);
+            EVP_DigestUpdate(mdctx, cnonce->ptr, cnonce->slen);
+            EVP_DigestUpdate(mdctx, ":", 1);
+            EVP_DigestUpdate(mdctx, qop->ptr, qop->slen);
+        }
         EVP_DigestUpdate(mdctx, ":", 1);
-        EVP_DigestUpdate(mdctx, cnonce->ptr, cnonce->slen);
-        EVP_DigestUpdate(mdctx, ":", 1);
-        EVP_DigestUpdate(mdctx, qop->ptr, qop->slen);
+        EVP_DigestUpdate(mdctx, ha2, digest_strlen);
+        EVP_DigestFinal_ex(mdctx, digest, &dig_len);
+        EVP_MD_CTX_free(mdctx);
     }
-    EVP_DigestUpdate(mdctx, ":", 1);
-    EVP_DigestUpdate(mdctx, ha2, digest_strlen);
-
-    EVP_DigestFinal_ex(mdctx, digest, &dig_len);
-    EVP_MD_CTX_free(mdctx);
 
     /* Convert digest to string and store in chal->response. */
     result->slen = digest_strlen;
@@ -488,7 +574,10 @@ PJ_DEF(pj_bool_t) pjsip_auth_is_algorithm_supported(
 #ifdef HAVE_NO_OPENSSL
     return (algorithm_type == PJSIP_AUTH_ALGORITHM_MD5);
 #else
-    {
+    /* For MD5, allow support even if OpenSSL disables it; we'll fallback. */
+    if (algorithm_type == PJSIP_AUTH_ALGORITHM_MD5) {
+        return PJ_TRUE;
+    } else {
         const EVP_MD* md;
         md = EVP_get_digestbyname(algorithm->openssl_name);
         if (md == NULL) {
@@ -832,9 +921,11 @@ PJ_DEF(pj_status_t) pjsip_auth_clt_init(  pjsip_auth_clt_sess *sess,
     sess->cred_cnt = 0;
     sess->cred_info = NULL;
     pj_list_init(&sess->cached_auth);
+    pj_bzero(&sess->pref, sizeof(sess->pref));
 
     sess->parent = NULL;
     sess->lock = NULL;
+    sess->async_opt = NULL;
     return PJ_SUCCESS;
 }
 
@@ -924,6 +1015,14 @@ PJ_DEF(pj_status_t) pjsip_auth_clt_clone( pj_pool_t *pool,
 
         if (status != PJ_SUCCESS)
             return status;
+    }
+
+    /* Clone async auth setting so forked dialogs inherit the
+     * async callback configuration.
+     */
+    if (rhs->async_opt) {
+        sess->async_opt = PJ_POOL_ALLOC_T(pool, pjsip_auth_clt_async_setting);
+        *sess->async_opt = *rhs->async_opt;
     }
 
     /* TODO note:
@@ -1763,3 +1862,131 @@ PJ_DEF(pj_status_t) pjsip_auth_clt_reinit_req(  pjsip_auth_clt_sess *sess,
 
 }
 
+
+PJ_DEF(pj_status_t) pjsip_auth_clt_async_configure(
+                                    pjsip_auth_clt_sess *sess,
+                                    const pjsip_auth_clt_async_setting *opt)
+{
+    PJ_ASSERT_RETURN(sess && opt && opt->cb, PJ_EINVAL);
+    DO_ON_PARENT_LOCKED(sess, pjsip_auth_clt_async_configure(sess->parent,
+                        opt));
+
+    if (!sess->async_opt) {
+        sess->async_opt = PJ_POOL_ZALLOC_T(sess->pool,
+                                           pjsip_auth_clt_async_setting);
+    }
+    *sess->async_opt = *opt;
+
+    return PJ_SUCCESS;
+}
+
+
+PJ_DEF(pj_status_t) pjsip_auth_clt_async_send_req(
+                                    pjsip_auth_clt_sess *sess,
+                                    void *token,
+                                    pjsip_tx_data *new_request)
+{
+    pjsip_auth_clt_async_impl_token *send_token =
+                                (pjsip_auth_clt_async_impl_token*)token;
+    pj_status_t status;
+
+    PJ_ASSERT_RETURN(sess && token && new_request, PJ_EINVAL);
+    DO_ON_PARENT_LOCKED(sess, pjsip_auth_clt_async_send_req(
+                                                        sess->parent,
+                                                        token, new_request));
+    PJ_ASSERT_RETURN(sess->async_opt && sess->async_opt->cb, PJ_EINVALIDOP);
+
+    /* Best effort to verify the integrity of the token */
+    if (!send_token->send_impl ||
+        pj_memcmp(send_token->signature, AUTH_TOKEN_SIGNATURE, 4) != 0)
+    {
+        return PJ_EINVAL;
+    }
+
+    /* Save grp_lock before send_impl — after dec_ref the token memory
+     * may be freed.
+     */
+    {
+        pj_grp_lock_t *grp_lock = send_token->grp_lock;
+
+        status = (*send_token->send_impl)(sess, send_token->user_data,
+                                          new_request);
+        /* Always invalidate the token after use.  Send failures are
+         * transport-level errors — not retryable with the same tdata.
+         */
+        pj_bzero(send_token->signature, 4);
+        if (grp_lock)
+            pj_grp_lock_dec_ref(grp_lock);
+    }
+
+    return status;
+}
+
+
+PJ_DEF(pj_status_t) pjsip_auth_clt_async_abandon(
+                                    pjsip_auth_clt_sess *sess,
+                                    void *token)
+{
+    pjsip_auth_clt_async_impl_token *impl_token =
+                                (pjsip_auth_clt_async_impl_token*)token;
+
+    PJ_ASSERT_RETURN(sess && token, PJ_EINVAL);
+    DO_ON_PARENT_LOCKED(sess, pjsip_auth_clt_async_abandon(sess->parent,
+                                                           token));
+
+    /* Best effort to verify the integrity of the token */
+    if (pj_memcmp(impl_token->signature, AUTH_TOKEN_SIGNATURE, 4) != 0)
+        return PJ_EINVAL;
+
+    /* Save grp_lock before any operation — after dec_ref the token memory
+     * may be freed.
+     */
+    {
+        pj_grp_lock_t *grp_lock = impl_token->grp_lock;
+
+        /* Clear the signature FIRST to prevent any further use of the
+         * token, even if abandon_impl triggers destruction of the session.
+         */
+        pj_bzero(impl_token->signature, 4);
+
+        if (impl_token->abandon_impl)
+            (*impl_token->abandon_impl)(sess, impl_token->user_data);
+
+        if (grp_lock)
+            pj_grp_lock_dec_ref(grp_lock);
+    }
+
+    return PJ_SUCCESS;
+}
+
+
+PJ_DEF(pj_status_t) pjsip_auth_clt_async_impl_on_challenge(
+                            pjsip_auth_clt_sess* sess,
+                            pjsip_auth_clt_async_impl_token *token,
+                            const pjsip_auth_clt_async_on_chal_param *param)
+{
+    pjsip_auth_clt_async_on_chal_param cb_param;
+
+    PJ_ASSERT_RETURN(sess && token && param && param->rdata && param->tdata,
+                     PJ_EINVAL);
+    DO_ON_PARENT_LOCKED(sess, pjsip_auth_clt_async_impl_on_challenge(
+                                                    sess->parent,
+                                                    token, param));
+
+    if (!sess->async_opt || !sess->async_opt->cb)
+        return PJ_EINVALIDOP;
+
+    pj_memcpy(token->signature, AUTH_TOKEN_SIGNATURE, 4);
+
+    cb_param           = *param;
+    cb_param.user_data = sess->async_opt->user_data;
+    if ((*sess->async_opt->cb)(sess, token, &cb_param)) {
+        return PJ_SUCCESS;
+    }
+
+    /* Callback chose not to handle — invalidate token, let caller
+     * fall through to synchronous path.
+     */
+    pj_bzero(token->signature, 4);
+    return PJ_EIGNORED;
+}

@@ -119,6 +119,21 @@ typedef struct pjsua_app_config
     pj_bool_t               auto_rec;
     pjsua_recorder_id       rec_id;
     pjsua_conf_port_id      rec_port;
+
+    /* Dynamic playback control */
+    pjsua_player_id         dyn_player_id;
+    pjsua_conf_port_id      dyn_player_port;
+    pjsua_call_id           dyn_player_call;
+    pj_bool_t               dyn_player_active;
+    char                    dyn_play_filename[PJ_MAXPATH];
+
+    /* Dynamic recording control */
+    pjsua_recorder_id       dyn_rec_id;
+    pjsua_conf_port_id      dyn_rec_port;
+    pjsua_call_id           dyn_rec_call;
+    pj_bool_t               dyn_rec_active;
+    char                    dyn_rec_filename[PJ_MAXPATH];
+
     unsigned                auto_answer;
     unsigned                duration;
 
@@ -153,6 +168,7 @@ typedef struct pjsua_app_config
     unsigned                avi_cnt;
     struct {
         pj_str_t                path;
+        pjsua_avi_player_id     p_id;
         pjmedia_vid_dev_index   dev_id;
         pjsua_conf_port_id      slot;
     } avi[PJSUA_APP_MAX_AVI];
@@ -171,6 +187,12 @@ typedef struct pjsua_app_config
     /* CLI setting */
     pj_bool_t               use_cli;
     cli_cfg_t               cli_cfg;
+
+#if !PJSUA_MEDIA_HAS_PJMEDIA
+    /* Custom SDP to inject via on_call_sdp_created (replaces generated SDP).
+     * Only available when PJSUA_MEDIA_HAS_PJMEDIA=0 (alt media backend). */
+    pj_str_t                custom_sdp;
+#endif
 } pjsua_app_config;
 
 /** Extern variable declaration **/
@@ -184,8 +206,11 @@ extern pj_bool_t            app_running;
 
 int my_atoi(const char *cs);
 int my_atoi2(const pj_str_t *s);
-int my_hex_string_to_octet_array(const char *hex, int len, char octet[]);
-void my_octet_array_to_hex_string(const char octet[], int len, char hex[]);
+pj_ssize_t my_hex_string_to_octet_array(const char *hex, pj_ssize_t len,
+                                        char octet[]);
+void my_octet_array_to_hex_string(const char octet[], pj_ssize_t len,
+                                  char hex[]);
+
 pj_bool_t find_next_call(void);
 pj_bool_t find_prev_call(void);
 void send_request(char *cstr_method, const pj_str_t *dst_uri);

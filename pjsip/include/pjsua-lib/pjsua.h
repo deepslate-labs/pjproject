@@ -273,6 +273,9 @@ typedef int pjsua_player_id;
 /** File recorder identification */
 typedef int pjsua_recorder_id;
 
+/** AVI player identification */
+typedef int pjsua_avi_player_id;
+
 /** AVI recorder identification */
 typedef int pjsua_avi_rec_id;
 
@@ -448,6 +451,33 @@ typedef struct pj_stun_resolve_result pj_stun_resolve_result;
 #ifndef PJSUA_DETECT_MERGED_REQUESTS
 #   define PJSUA_DETECT_MERGED_REQUESTS  1
 #endif
+
+
+/**
+ * Is session record (siprec) enabled.
+ *
+ * This feature is not fully implemented yet. Currently it only signals and
+ * verifies siprec capability in Supported & Required headers in INVITE.
+ *
+ * Default: 0 (disabled)
+ */
+#ifndef PJSUA_HAS_SIPREC
+#   define PJSUA_HAS_SIPREC              0
+#endif
+
+
+/**
+ * Enable support for RFC 4235 dialog event package. This was introduced in
+ * PJSIP version 2.16 and provides client-side dialog event subscription
+ * support. Set this to 0 to disable the dialog event package, which can be
+ * useful if you have your own implementation of the dialog event server.
+ *
+ * Default: 1 (enabled)
+ */
+#ifndef PJSUA_HAS_DLG_EVENT_PKG
+#   define PJSUA_HAS_DLG_EVENT_PKG       1
+#endif
+
 
 /**
  * This enumeration represents pjsua state.
@@ -942,6 +972,7 @@ typedef union pjsua_ip_change_op_info {
         pjsua_acc_id acc_id;
         pjsua_call_id call_id;
     } acc_reinvite_calls;
+
 } pjsua_ip_change_op_info;
 
 
@@ -1215,6 +1246,63 @@ typedef void (*pjsua_on_rejected_incoming_call_cb)(
 
 
 /**
+ * This structure contains the parameters for \a on_auth_challenge callback.
+ */
+typedef struct pjsua_on_auth_challenge_param
+{
+    /**
+     * The account ID associated with the challenged request.
+     * May be PJSUA_INVALID_ID if the account cannot be determined.
+     */
+    pjsua_acc_id                acc_id;
+
+    /**
+     * The call ID associated with the challenged request.
+     * Will be PJSUA_INVALID_ID for non-call requests (REGISTER, PUBLISH,
+     * out-of-dialog MESSAGE, etc.).
+     */
+    pjsua_call_id               call_id;
+
+    /**
+     * The account-level shared authentication session.
+     * Use this when calling pjsip_auth_clt_async_send_req() or
+     * pjsip_auth_clt_async_abandon().
+     */
+    pjsip_auth_clt_sess        *auth_sess;
+
+    /**
+     * The authentication token to be passed to
+     * pjsip_auth_clt_async_send_req() or pjsip_auth_clt_async_abandon().
+     */
+    void                       *token;
+
+    /**
+     * The 401/407 response containing the challenge.
+     * Only valid during the callback. Clone with pjsip_rx_data_clone()
+     * if needed beyond the callback.
+     */
+    const pjsip_rx_data        *rdata;
+
+    /**
+     * The original request that was challenged. Needed to build the
+     * authenticated retry. Only valid during the callback unless the
+     * application extends its lifetime using pjsip_tx_data_add_ref().
+     */
+    pjsip_tx_data              *tdata;
+
+    /**
+     * Output: set to PJ_TRUE if the application handles the challenge.
+     * The application MUST then eventually call
+     * pjsip_auth_clt_async_send_req() or pjsip_auth_clt_async_abandon().
+     * Default PJ_FALSE means the library handles authentication
+     * via the synchronous path.
+     */
+    pj_bool_t                   handled;
+
+} pjsua_on_auth_challenge_param;
+
+
+/**
  * This structure describes application callback to receive various event
  * notification from PJSUA-API. All of these callbacks are OPTIONAL,
  * although definitely application would want to implement some of
@@ -1307,7 +1395,7 @@ typedef struct pjsua_callback
      * (as opposed to on_stream_created() and on_stream_created2() which are
      * called *after* the session has been created). The application may change
      * some stream info parameter values, i.e: jb_init, jb_min_pre, jb_max_pre,
-     * jb_max, use_ka, rtcp_sdes_bye_disabled, jb_discard_algo (audio),
+     * jb_max, use_ka, ka_cfg, rtcp_sdes_bye_disabled, jb_discard_algo (audio),
      * rx_event_pt (audio), codec_param->enc_fmt (video).
      *
      * @param call_id       Call identification.
@@ -2165,6 +2253,46 @@ typedef struct pjsua_callback
      */
     pjsua_on_rejected_incoming_call_cb on_rejected_incoming_call;
 
+    /**
+     * This callback will be invoked when a port operation has been
+     * completed. This callback will most likely be called from media threads,
+     * thus application must not perform long/blocking processing in this
+     * callback.
+     */
+    pjmedia_conf_op_cb on_conf_op_completed;
+
+    /**
+     * This callback will be invoked when a video port operation has been
+     * completed. This callback will most likely be called from media threads,
+     * thus application must not perform long/blocking processing in this
+     * callback.
+     */
+    pjmedia_vid_conf_op_cb on_vid_conf_op_completed;
+
+    /**
+     * This callback is called when a 401/407 challenge is received.
+     * It may be triggered by any outgoing SIP request that receives a
+     * 401/407 response, including REGISTER, INVITE, PUBLISH, MESSAGE, etc.
+     *
+     * To handle the challenge, the application should set
+     * \a param->handled to PJ_TRUE and later call
+     * pjsip_auth_clt_async_send_req() to resend with authentication,
+     * or pjsip_auth_clt_async_abandon() to give up. Both may be called
+     * synchronously within this callback or deferred.
+     *
+     * If \a param->handled is left as PJ_FALSE (the default), the library
+     * falls back to synchronous authentication using configured credentials.
+     *
+     * If this callback is not set, the library will handle authentication
+     * automatically using the configured credentials (synchronous path).
+     *
+     * Note: this callback is invoked from the SIP worker thread.
+     * PJSUA_LOCK is NOT held during the callback.
+     *
+     * @param param     The callback parameters.
+     */
+    void (*on_auth_challenge)(pjsua_on_auth_challenge_param *param);
+
 } pjsua_callback;
 
 
@@ -2563,6 +2691,17 @@ typedef struct pjsua_config
      */
     pj_str_t         upnp_if_name;
 
+    /**
+     * When non-zero, "norefersub" is advertised in the SIP Supported header
+     * per RFC 4488, indicating that this endpoint is capable of suppressing
+     * the implicit REFER event subscription.  The actual suppression is
+     * negotiated per-call via the Refer-Sub header; this flag only controls
+     * whether the capability is announced.
+     *
+     * Default: PJ_TRUE
+     */
+    pj_bool_t        no_refer_sub;
+
 } pjsua_config;
 
 
@@ -2646,10 +2785,20 @@ struct pjsua_msg_data
     pj_str_t    local_uri;
 
     /**
+     * Optional contact URI to be used for this call. If NULL, the contact
+     * will be generated automatically based on the account configuration.
+     * This field is currently used only by pjsua_call_make_call().
+     */
+    pj_str_t    contact_uri;
+
+    /**
      * Additional message headers as linked list. Application can add
      * headers to the list by creating the header, either from the heap/pool
      * or from temporary local variable, and add the header using
      * linked list operation. See pjsua_app.c for some sample codes.
+     *
+     * Application may override Max-Forwards header value (the default is
+     * #PJSIP_MAX_FORWARDS_VALUE) by adding a Max-Forwards header here.
      */
     pjsip_hdr   hdr_list;
 
@@ -3572,6 +3721,24 @@ PJ_DECL(pj_status_t) pjsua_transport_lis_start( pjsua_transport_id id,
 
 
 /**
+ * Restart the listener of the transport. This will close the listener socket
+ * and recreate it. For TLS transports, TLS settings can be specified in the
+ * transport config to update certificates, keys, and other TLS parameters 
+ * during runtime. For UDP transports, this will restart the transport with
+ * new settings.
+ *
+ * @param id            Transport ID.
+ * @param cfg           The new transport config used by the listener. 
+ *                      For TCP/TLS: port, public_addr, bound_addr, and tls_setting
+ *                      are used. For UDP: port, public_addr, and bound_addr are used.
+ *
+ * @return              PJ_SUCCESS on success, or the appropriate error code.
+ */
+PJ_DECL(pj_status_t) pjsua_transport_lis_restart( pjsua_transport_id id,
+                                                  const pjsua_transport_config *cfg);
+
+
+/**
  * @}
  */
 
@@ -3693,7 +3860,7 @@ PJ_DECL(pj_status_t) pjsua_transport_lis_start( pjsua_transport_id id,
 #endif
 
 /**
- * When the registration is successfull, the auto registration refresh will
+ * When the registration is successful, the auto registration refresh will
  * be sent before it expires. Setting this to 0 will disable it.
  * This is useful for app that uses Push Notification and doesn't require auto
  * registration refresh. App can periodically send refresh registration or
@@ -3869,6 +4036,19 @@ typedef struct pjsua_ice_config
      * Default: -1 (maximum not set)
      */
     int                 ice_max_host_cands;
+
+    /**
+     * Number of manual host candidates. This must be equal or less than
+     * \a ice_max_host_cands.
+     */
+    unsigned            ice_manual_host_cnt;
+
+    /**
+     * Optional configuration to manually specify host candidates.
+     * Each candidate will use the same port as the automatic/base host
+     * candidate.
+     */
+    pj_sockaddr         ice_manual_host[PJ_ICE_ST_MAX_CAND];
 
     /**
      * ICE session options.
@@ -4748,16 +4928,44 @@ typedef struct pjsua_acc_config
 
     /**
      * Use a shared authorization session within this account.
-     * This will use the accounts credentials on outgoing requests,
-     * so that less 401/407 Responses will be returned.
+     * This will use the account's credentials on outgoing requests,
+     * so that fewer 401/407 responses will be returned.
+     *
+     * When the \a on_auth_challenge callback is set, the shared session
+     * is also used as the auth session passed to the callback, regardless
+     * of this setting.
      *
      * Needs PJSIP_AUTH_AUTO_SEND_NEXT and PJSIP_AUTH_HEADER_CACHING
      * enabled to work properly, and also will grow usage of the used pool for
      * the cached headers.
      *
      * Default: PJ_FALSE
+     *
+     * @see pjsua_callback::on_auth_challenge
      */
     pj_bool_t        use_shared_auth;
+
+    /**
+    * Specify whether incoming SIP MESSAGE requests are responded
+    * automatically.
+    *
+    * If set to PJ_TRUE (automatic response), incoming MESSAGE requests
+    * will be responded to immediately with SIP 200 OK (legacy behavior).
+    *
+    * If set to PJ_FALSE, incoming MESSAGE requests will create UAS
+    * transactions supporting explicit responses and defering responses.
+    *
+    * The application may either respond immediately in the on_pager() or
+    * on_pager2() callbacks by using pjsua_acc_send_response(), or defer the
+    * response to later time. In the latter case, the application must clone the
+    * rx_data by calling pjsip_rx_data_clone() within on_pager() or on_pager2()
+    * callbacks. The cloned rx_data and the pointer to the transaction can then
+    * be used later for pjsua_acc_send_response().
+    *
+    * Default: PJ_TRUE (automatic response for backward compatibility)
+    */
+    pj_bool_t        auto_repond_sip_message;
+
 
 } pjsua_acc_config;
 
@@ -5040,15 +5248,70 @@ PJ_DECL(void*) pjsua_acc_get_user_data(pjsua_acc_id acc_id);
 
 
 /**
+ * Parameters for account deletion with pjsua_acc_del2(). Application should
+ * use #pjsua_acc_del_param_default() to initialize this structure with its
+ * default values.
+ */
+typedef struct pjsua_acc_del_param
+{
+    /**
+     * If PJ_TRUE, the account will always be deleted even when there are
+     * active calls using it (a warning will be logged). If PJ_FALSE, the
+     * function will return PJ_EBUSY when active calls exist.
+     *
+     * Default: PJ_FALSE
+     */
+    pj_bool_t   force;
+
+} pjsua_acc_del_param;
+
+
+/**
+ * Initialize account deletion parameters with default values.
+ *
+ * @param prm           The parameter to be initialized.
+ */
+PJ_DECL(void) pjsua_acc_del_param_default(pjsua_acc_del_param *prm);
+
+
+/**
  * Delete an account. This will unregister the account from the SIP server,
  * if necessary, and terminate server side presence subscriptions associated
  * with this account.
+ *
+ * This function always deletes the account regardless of active calls
+ * (equivalent to calling pjsua_acc_del2() with force=PJ_TRUE). For safer
+ * behavior that checks for active calls, use pjsua_acc_del2() instead.
  *
  * @param acc_id        Id of the account to be deleted.
  *
  * @return              PJ_SUCCESS on success, or the appropriate error code.
  */
 PJ_DECL(pj_status_t) pjsua_acc_del(pjsua_acc_id acc_id);
+
+
+/**
+ * Delete an account with additional options. This will unregister the account
+ * from the SIP server, if necessary, and terminate server side presence
+ * subscriptions associated with this account.
+ *
+ * By default (force=PJ_FALSE), if there are active calls using this account,
+ * this function will return PJ_EBUSY. Application should hang up all calls
+ * first using pjsua_call_hangup() and wait until the calls are fully
+ * disconnected before deleting the account.
+ *
+ * When force=PJ_TRUE, the account will be deleted even if there are active
+ * calls. A warning will be logged but deletion will proceed.
+ *
+ * @param acc_id        Id of the account to be deleted.
+ * @param prm           Account deletion parameters.
+ *
+ * @return              PJ_SUCCESS on success, PJ_EBUSY if force is PJ_FALSE
+ *                      and there are active calls using this account, or the
+ *                      appropriate error code.
+ */
+PJ_DECL(pj_status_t) pjsua_acc_del2(pjsua_acc_id acc_id,
+                                     const pjsua_acc_del_param *prm);
 
 
 /**
@@ -5094,6 +5357,34 @@ PJ_DECL(pj_status_t) pjsua_acc_modify(pjsua_acc_id acc_id,
                                       const pjsua_acc_config *acc_cfg);
 
 /**
+ * Send response to incoming request (e.g. SIP MESSAGE) that was
+ * processed by a UAS transaction.
+ *
+ * This function can be used when the application wants to defer a
+ * response to an incoming request that was processed by 
+ * a UAS transaction.
+ *
+ * @param acc_id        The account that will send the response.
+ * @param rdata         The received request data.
+ * @param tsx           The UAS transaction that was created for the incoming
+ *                      request.
+ * @param st_code       Status code to be sent (e.g., 200 for OK, 400 for 
+ *                      Bad Request, etc.).
+ * @param st_text       Optional status text. If NULL, default status text for
+ *                      the status code will be used.
+ * @param msg_data      Optional headers etc. to be added to the outgoing
+ *                      response, or NULL if no custom header is desired.
+ *
+ * @return              PJ_SUCCESS on success, or the appropriate error code.
+ */
+PJ_DECL(pj_status_t) pjsua_acc_send_response(pjsua_acc_id acc_id,
+                                             pjsip_rx_data *rdata,
+                                             pjsip_transaction *tsx,
+                                             int st_code,
+                                             const pj_str_t *st_text,
+                                             const pjsua_msg_data *msg_data);
+
+/**
  * Send arbitrary out-of-dialog requests from an account, e.g. OPTIONS.
  * The application should use the call or presence API to create
  * dialog-related requests.
@@ -5102,7 +5393,8 @@ PJ_DECL(pj_status_t) pjsua_acc_modify(pjsua_acc_id acc_id,
  * @param dest_uri      URI to be put into the To header (normally is the same
  *                      as the target URI).
  * @param method        The SIP method of the request.
- * @param options       This is for future use (currently only NULL is supported).
+ * @param options       This is for future use (currently only NULL is
+ *                      supported).
  * @param token         Arbitrary token (user data owned by the application)
  *                      to be passed back to the application in callback
  *                      on_acc_send_request().
@@ -6442,6 +6734,18 @@ PJ_DECL(pj_status_t) pjsua_call_send_dtmf(pjsua_call_id call_id,
                                       const pjsua_call_send_dtmf_param *param);
 
 /**
+ * Get the number of queued DTMF digits for transmission in the call.
+ *
+ * @param call_id       Call identification.
+ * @param digits        On return, will contain the number of DTMF digits
+ *                      queued for transmission.
+ *
+ * @return              PJ_SUCCESS on success, or the appropriate error code.
+ */
+PJ_DECL(pj_status_t) pjsua_call_get_queued_dtmf_digits(pjsua_call_id call_id,
+                                                       unsigned *digits);
+
+/**
  * Send real-time text to remote via RTP stream. This only works if the call
  * has text media.
  *
@@ -7261,7 +7565,6 @@ PJ_DECL(pj_status_t) pjsua_im_typing(pjsua_acc_id acc_id,
                                      const pjsua_msg_data *msg_data);
 
 
-
 /**
  * @}
  */
@@ -7440,6 +7743,13 @@ PJ_DECL(pj_status_t) pjsua_im_typing(pjsua_acc_id acc_id,
 #endif
 
  /**
+  * The maximum avi file player.
+  */
+#ifndef PJSUA_MAX_AVI_PLAYERS
+#   define PJSUA_MAX_AVI_PLAYERS        4
+#endif
+
+ /**
   * The maximum avi file recorder.
   */
 #ifndef PJSUA_MAX_AVI_RECORDERS
@@ -7534,6 +7844,23 @@ struct pjsua_media_config
      * Default value: PJSUA_MAX_CONF_PORTS
      */
     unsigned            max_media_ports;
+
+    /**
+     * Total number of threads that can be used by the conference bridge
+     * including get_frame() thread.
+     * 
+     * This value is used to determine if the conference bridge should be
+     * implemented as a parallel bridge or not.
+     * If the value is set to 0 or 1, the conference bridge will be implemented as a
+     * serial bridge, otherwise it will be implemented as a parallel bridge.
+     * 
+     * This value is ignored by all conference backends except for the 
+     * multithreaded conference bridge backend
+     * (PJMEDIA_CONF_PARALLEL_BRIDGE_BACKEND).
+     *
+     * Default value: PJMEDIA_CONF_THREADS
+     */
+    unsigned            conf_threads;
 
     /**
      * Specify whether the media manager should manage its own
@@ -7784,11 +8111,14 @@ struct pjsua_media_config
      * Optional callback for audio frame preview right before queued to
      * the speaker.
      * Notes:
-     * - application MUST NOT block or perform long operation in the callback
-     *   as the callback may be executed in sound device thread
-     * - when using software echo cancellation, application MUST NOT modify
+     * - Application MUST NOT block or perform long operation in the callback
+     *   as the callback may be executed in sound device thread.
+     * - When using software echo cancellation, application MUST NOT modify
      *   the audio data from within the callback, otherwise the echo canceller
      *   will not work properly.
+     * - Application MUST NOT stop or switch the audio device, or modify
+     *   audio device settings (e.g: by calling #pjsua_set_ec()) from
+     *   within this callback.
      */
     void (*on_aud_prev_play_frame)(pjmedia_frame *frame);
 
@@ -7797,11 +8127,14 @@ struct pjsua_media_config
      * before being processed by any media component such as software echo
      * canceller.
      * Notes:
-     * - application MUST NOT block or perform long operation in the callback
-     *   as the callback may be executed in sound device thread
-     * - when using software echo cancellation, application MUST NOT modify
+     * - Application MUST NOT block or perform long operation in the callback
+     *   as the callback may be executed in sound device thread.
+     * - When using software echo cancellation, application MUST NOT modify
      *   the audio data from within the callback, otherwise the echo canceller
      *   will not work properly.
+     * - Application MUST NOT stop or switch the audio device, or modify
+     *   audio device settings (e.g: by calling #pjsua_set_ec()) from
+     *   within this callback.
      */
     void (*on_aud_prev_rec_frame)(pjmedia_frame *frame);
 };
@@ -8084,6 +8417,9 @@ PJ_DECL(pj_status_t) pjsua_conf_get_port_info( pjsua_conf_port_id port_id,
  * media ports that are created by PJSUA-LIB (such as calls, file player,
  * or file recorder), PJSUA-LIB will automatically add the port to
  * the bridge.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_conf_op_completed to receive notification upon completion.
  *
  * @param pool          Pool to use.
  * @param port          Media port to be added to the bridge.
@@ -8101,6 +8437,9 @@ PJ_DECL(pj_status_t) pjsua_conf_add_port(pj_pool_t *pool,
  * Remove arbitrary slot from the conference bridge. Application should only
  * call this function if it registered the port manually with previous call
  * to #pjsua_conf_add_port().
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_conf_op_completed to receive notification upon completion.
  *
  * @param port_id       The slot id of the port to be removed.
  *
@@ -8119,6 +8458,9 @@ PJ_DECL(pj_status_t) pjsua_conf_remove_port(pjsua_conf_port_id port_id);
  * If bidirectional media flow is desired, application needs to call
  * this function twice, with the second one having the arguments
  * reversed.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_conf_op_completed to receive notification upon completion.
  *
  * @param source        Port ID of the source media/transmitter.
  * @param sink          Port ID of the destination media/received.
@@ -8150,6 +8492,9 @@ PJ_DECL(pj_status_t) pjsua_conf_connect(pjsua_conf_port_id source,
  * If bidirectional media flow is desired, application needs to call
  * this function twice, with the second one having the arguments
  * reversed.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_conf_op_completed to receive notification upon completion.
  *
  * @param source        Port ID of the source media/transmitter.
  * @param sink          Port ID of the destination media/received.
@@ -8166,6 +8511,9 @@ PJ_DECL(pj_status_t) pjsua_conf_connect2(pjsua_conf_port_id source,
 /**
  * Disconnect media flow from the source to destination port.
  *
+ * This operation executes asynchronously, use the callback set from
+ * \a on_conf_op_completed to receive notification upon completion.
+ * 
  * @param source        Port ID of the source media/transmitter.
  * @param sink          Port ID of the destination media/received.
  *
@@ -8412,6 +8760,100 @@ PJ_DECL(pj_status_t) pjsua_recorder_get_port(pjsua_recorder_id id,
  * @return              PJ_SUCCESS on success, or the appropriate error code.
  */
 PJ_DECL(pj_status_t) pjsua_recorder_destroy(pjsua_recorder_id id);
+
+
+/*****************************************************************************
+ * AVI player.
+ */
+
+ /**
+  * Create an avi file player, and automatically add this player to
+  * the audio/video conference bridge. The player will create a virtual
+  * video device and audio/video media port based on the streams contained
+  * in the file.
+  * The maximum number of stream is limited to PJSUA_MAX_AVI_NUM_STREAMS
+  * and the video stream is limited to one stream.
+  *
+  * @param filename      The filename to be played. Currently only
+  *                      AVI files are supported. The video stream is using
+  *                      YUY2/I420/RGB24 (uncompressed) format and the audio
+  *                      stream is using 16 bit PCM format.
+  *                      Filename's length must be smaller than PJ_MAXPATH.
+  * @param p_id          Pointer to receive player ID.
+  *
+  * @return              PJ_SUCCESS on success, or the appropriate error code.
+  */
+PJ_DECL(pj_status_t) pjsua_avi_player_create(const pj_str_t *filename,
+                                             pjsua_avi_player_id *id);
+
+/**
+ * Get the video device index of the avi player. Application can use this index
+ * as the video source/capture device.
+ *
+ * @param id            The avi player id.
+ *
+ * @return              The video device id or PJMEDIA_VID_INVALID_DEV if the
+ *                      player doesn't have a video device.
+ */
+PJ_DECL(pjmedia_vid_dev_index) pjsua_avi_player_get_vid_dev(
+                                                        pjsua_avi_player_id id);
+
+/**
+ * Get the number of streams created by the avi player.
+ *
+ * @param id            The avi player id.
+ * @param strm_type     The stream type.
+ *
+ * @return              The number of media stream of the avi player.
+ */
+PJ_DECL(unsigned) pjsua_avi_player_get_num_stream(pjsua_avi_player_id id,
+                                                  pjmedia_type strm_type);
+
+/**
+ * Get conference port ID associated with avi player based on the media type.
+ *
+ * @param id            The avi player id.
+ *
+ * @param strm_type     The stream type.
+ * @param strm_idx      The stream index.
+ *
+ * @return              The video/audio conference port id.
+ */
+PJ_DECL(pjsua_conf_port_id) pjsua_avi_player_get_conf_port(
+                                                        pjsua_avi_player_id id,
+                                                        pjmedia_type strm_type,
+                                                        unsigned strm_idx);
+
+/**
+ * Get the media port for the avi player based on the media type.
+ *
+ * @param id            The avi player id.
+ *
+ * @param strm_type     The stream type.
+ * @param strm_idx      The stream index.
+ * @param p_port        The media port port associated with the avi player.
+ *
+ * @return              The PJ_SUCCESS on success,or the appropriate error code.
+ *
+ */
+PJ_DECL(pj_status_t) pjsua_avi_player_get_port(pjsua_avi_player_id id,
+                                               pjmedia_type strm_type,
+                                               unsigned strm_idx,
+                                               pjmedia_port **p_port);
+
+/**
+ * Close the avi file, remove the media streams from the bridge, and free
+ * resources associated with the avi player. This API will try to remove the
+ * ports before freeing the resources. However, since the operation is done
+ * asynchronously, it might return PJ_EBUSY when the ports are still in use.
+ * In this case, application can retry calling this API after the port removal
+ * is done.
+ *
+ * @param id            The avi player ID.
+ *
+ * @return              PJ_SUCCESS on success, or the appropriate error code.
+ */
+PJ_DECL(pj_status_t) pjsua_avi_player_destroy(pjsua_avi_player_id id);
 
 
 /*****************************************************************************
@@ -9446,6 +9888,9 @@ PJ_DECL(pj_status_t) pjsua_vid_conf_get_port_info(
  * Application can use this function to add the media port that it creates.
  * For media ports that are created by PJSUA-LIB (such as calls, AVI player),
  * PJSUA-LIB will automatically add the port to the bridge.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_vid_conf_op_completed to receive notification upon completion.
  *
  * @param pool          Pool to use.
  * @param port          Media port to be added to the bridge.
@@ -9465,6 +9910,9 @@ PJ_DECL(pj_status_t) pjsua_vid_conf_add_port(pj_pool_t *pool,
  * Remove arbitrary slot from the video conference bridge. Application should
  * only call this function if it registered the port manually with previous
  * call to #pjsua_vid_conf_add_port().
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_vid_conf_op_completed to receive notification upon completion.
  *
  * @param port_id       The slot id of the port to be removed.
  *
@@ -9484,6 +9932,9 @@ PJ_DECL(pj_status_t) pjsua_vid_conf_remove_port(pjsua_conf_port_id port_id);
  * If bidirectional media flow is desired, application needs to call
  * this function twice, with the second one having the arguments
  * reversed.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_vid_conf_op_completed to receive notification upon completion.
  *
  * @param source        Port ID of the source media/transmitter.
  * @param sink          Port ID of the destination media/received.
@@ -9499,6 +9950,9 @@ PJ_DECL(pj_status_t) pjsua_vid_conf_connect(pjsua_conf_port_id source,
 /**
  * Disconnect video flow from the source to destination port.
  *
+ * This operation executes asynchronously, use the callback set from
+ * \a on_vid_conf_op_completed to receive notification upon completion.
+ * 
  * @param source        Port ID of the source media/transmitter.
  * @param sink          Port ID of the destination media/received.
  *
@@ -9514,6 +9968,9 @@ PJ_DECL(pj_status_t) pjsua_vid_conf_disconnect(pjsua_conf_port_id source,
  * a video stream decoder learns that incoming video size or frame rate
  * has changed, video conference needs to be informed to update its
  * internal states.
+ * 
+ * This operation executes asynchronously, use the callback set from
+ * \a on_vid_conf_op_completed to receive notification upon completion.
  *
  * @param port_id       The slot id of the port to be updated.
  *

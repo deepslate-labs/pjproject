@@ -33,7 +33,6 @@
 /* Only build when the backend is Windows I/O Completion Ports. */
 #if PJ_IOQUEUE_IMP == PJ_IOQUEUE_IMP_IOCP
 
-
 #define THIS_FILE "ioq_winnt"
 
 #if defined(PJ_HAS_WINSOCK2_H) && PJ_HAS_WINSOCK2_H != 0
@@ -86,6 +85,10 @@ typedef struct ioqueue_overlapped
     WSABUF                 wsabuf;
     pj_sockaddr_in         dummy_addr;
     int                    dummy_addrlen;
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+    pj_ssize_t             bytes_read;
+#endif
 } ioqueue_overlapped;
 
 #if PJ_HAS_TCP
@@ -162,6 +165,13 @@ struct pj_ioqueue_key_t
     pj_bool_t           closing;
     struct pending_op   pending_list;
     struct pending_op   free_pending_list;
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+    pj_thread_t        *read_callback_thread;
+    struct pending_op   read_cb_list;
+    pj_thread_t        *write_callback_thread;
+    struct pending_op   write_cb_list;
+#endif
 };
 
 /*
@@ -203,7 +213,7 @@ static FnCancelIoEx fnCancelIoEx = NULL;
 static void key_on_destroy(void* data);
 static void increment_counter(pj_ioqueue_key_t* key);
 static void decrement_counter(pj_ioqueue_key_t* key);
-
+static pj_status_t cancel_all_pending_op(pj_ioqueue_key_t *key);
 
 #define PENDING_OP_POS(op_key) (PJ_ARRAY_SIZE(op_key->internal__) - 1)
 
@@ -383,11 +393,7 @@ PJ_DEF(pj_status_t) pj_ioqueue_clear_key( pj_ioqueue_key_t *key )
 {
     PJ_ASSERT_RETURN(key, PJ_EINVAL);
 
-    pj_ioqueue_lock_key(key);
-
-    key->connecting = 0;
-
-    pj_ioqueue_unlock_key(key);
+    cancel_all_pending_op(key);
 
     return PJ_SUCCESS;
 
@@ -481,6 +487,11 @@ PJ_DEF(pj_status_t) pj_ioqueue_create2(pj_pool_t *pool,
         /* Initialize pending op lists */
         pj_list_init(&key->pending_list);
         pj_list_init(&key->free_pending_list);
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+        pj_list_init(&key->read_cb_list);
+        pj_list_init(&key->write_cb_list);
+#endif
 
         pj_list_push_back(&ioqueue->free_list, key);
     }
@@ -742,6 +753,13 @@ static void key_on_destroy(void *data) {
     pj_assert(pj_list_empty(&key->pending_list));
     pj_list_init(&key->free_pending_list);
 
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+    pj_assert(pj_list_empty(&key->read_cb_list));
+    pj_list_init(&key->read_cb_list);
+    pj_assert(pj_list_empty(&key->write_cb_list));
+    pj_list_init(&key->write_cb_list);
+#endif
+
     /* Return key to free list */
     pj_lock_acquire(ioqueue->lock);
     pj_list_erase(key);
@@ -827,7 +845,109 @@ static void release_pending_op(pj_ioqueue_key_t *key, struct pending_op *op)
 
 static pj_status_t cancel_all_pending_op(pj_ioqueue_key_t *key)
 {
+    /* Cancel any outstanding op */
     BOOL rc = fnCancelIoEx(key->hnd, NULL);
+
+    pj_ioqueue_lock_key(key);
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+    /* Clear any pending read callbacks */
+    while (!pj_list_empty(&key->read_cb_list)) {
+        struct pending_op *op = key->read_cb_list.next;
+        pj_list_erase(op);
+        pj_list_push_back(&key->free_pending_list, op);
+        decrement_counter(key);
+    }
+
+    /* Do NOT clear write_cb_list here. The write_callback_thread will
+     * drain it (IS_CLOSING check removed from
+     * ioqueue_dispatch_write_event_no_lock). See #4864, #4878.
+     *
+     * Exception: if WE are the write_callback_thread (unregister called
+     * from within a write callback), drain write_cb_list ourselves now.
+     * After we return, pj_ioqueue_unregister() will clear the callback
+     * pointers, and dispatch_write_event_no_lock would see NULL callback.
+     */
+    if (key->write_callback_thread == pj_thread_this()) {
+        while (!pj_list_empty(&key->write_cb_list)) {
+            struct pending_op *op = key->write_cb_list.next;
+            void (*on_wr_complete)(pj_ioqueue_key_t*,
+                                   pj_ioqueue_op_key_t*,
+                                   pj_ssize_t);
+
+            pj_list_erase(op);
+            on_wr_complete = key->cb.on_write_complete;
+            OPKEY_OPERATION(op->app_op_key) = 0;
+            pj_ioqueue_unlock_key(key);
+
+            if (on_wr_complete) {
+                on_wr_complete(key, op->app_op_key,
+                               op->pending_key.overlapped.bytes_read);
+            }
+            release_pending_op(key, op);
+            pj_ioqueue_lock_key(key);
+        }
+    }
+
+    /* Wait until any read callback is finished */
+    do {
+        unsigned counter = 0;
+
+        while (key->read_callback_thread &&
+               key->read_callback_thread != pj_thread_this())
+        {
+            /* Callback is running, unlock while waiting, since the callback
+             * may need the lock.
+             */
+            pj_ioqueue_unlock_key(key);
+            pj_thread_sleep(10);
+            pj_ioqueue_lock_key(key);
+
+            /* Clear any pending read callbacks again */
+            while (!pj_list_empty(&key->read_cb_list)) {
+                struct pending_op *op = key->read_cb_list.next;
+                pj_list_erase(op);
+                pj_list_push_back(&key->free_pending_list, op);
+                decrement_counter(key);
+            }
+
+            /* Timeout after ~1 second */
+            if (++counter > 100) {
+                PJ_LOG(1,(THIS_FILE, "Timeout waiting for read callback "
+                                     "to finish on key=%p", key));
+                break;
+            }
+        }
+    } while (0);
+
+    /* Wait until any write callback is finished. The callback thread
+     * will drain write_cb_list (completed ops with success status).
+     */
+    do {
+        unsigned counter = 0;
+
+        while (key->write_callback_thread &&
+               key->write_callback_thread != pj_thread_this())
+        {
+            /* Callback is running, unlock while waiting, since the callback
+             * may need the lock.
+             */
+            pj_ioqueue_unlock_key(key);
+            pj_thread_sleep(10);
+            pj_ioqueue_lock_key(key);
+
+            /* Timeout after ~1 second */
+            if (++counter > 100) {
+                PJ_LOG(1,(THIS_FILE, "Timeout waiting for write callback "
+                                     "to finish on key=%p", key));
+                break;
+            }
+        }
+    } while (0);
+#endif
+
+    key->connecting = 0;
+    pj_ioqueue_unlock_key(key);
 
     if (rc == 0) {
         DWORD dwError = WSAGetLastError();
@@ -840,6 +960,102 @@ static pj_status_t cancel_all_pending_op(pj_ioqueue_key_t *key)
     TRACE((THIS_FILE, "CANCEL key %p success", key));
     return PJ_SUCCESS;
 }
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+static unsigned ioqueue_dispatch_read_event_no_lock(pj_ioqueue_key_t* h,
+                                                    unsigned max_event)
+{
+    unsigned event_cnt = 0;
+
+    while (1) {
+        struct pending_op *read_op = NULL;
+        void (*on_read_complete)(pj_ioqueue_key_t *key,
+                                 pj_ioqueue_op_key_t *op_key,
+                                 pj_ssize_t bytes_read);
+
+        /* Check if there is any pending read callback for this key. */
+        pj_ioqueue_lock_key(h);
+
+        if (!h->closing && !pj_list_empty(&h->read_cb_list) &&
+            (max_event == 0 || event_cnt < max_event))
+        {
+            read_op = h->read_cb_list.next;
+            pj_list_erase(read_op);
+            on_read_complete = h->cb.on_read_complete;
+            OPKEY_OPERATION(read_op->app_op_key) = 0;
+        } else {
+            /* No more pending callback or maximum event number is reached.
+             * Clear the callback thread and return.
+             */
+            h->read_callback_thread = NULL;
+            on_read_complete = NULL;
+        }
+
+        pj_ioqueue_unlock_key(h);
+        PJ_RACE_ME(5);
+
+        /* Invoke the callback or return */
+        if (on_read_complete) {
+            (*on_read_complete)(h, read_op->app_op_key,
+                                read_op->pending_key.overlapped.bytes_read);
+
+            release_pending_op(h, read_op);
+            ++event_cnt;
+        } else {
+            break;
+        }
+    }
+
+    return event_cnt;
+}
+
+static unsigned ioqueue_dispatch_write_event_no_lock(pj_ioqueue_key_t* h,
+                                                      unsigned max_event)
+{
+    unsigned event_cnt = 0;
+
+    while (1) {
+        struct pending_op *write_op = NULL;
+        void (*on_write_complete)(pj_ioqueue_key_t *key,
+                                  pj_ioqueue_op_key_t *op_key,
+                                  pj_ssize_t bytes_sent);
+
+        /* Check if there is any pending write callback for this key. */
+        pj_ioqueue_lock_key(h);
+
+        if (!pj_list_empty(&h->write_cb_list) &&
+            (max_event == 0 || event_cnt < max_event))
+        {
+            write_op = h->write_cb_list.next;
+            pj_list_erase(write_op);
+            on_write_complete = h->cb.on_write_complete;
+            OPKEY_OPERATION(write_op->app_op_key) = 0;
+        } else {
+            /* No more pending callback or maximum event number is reached.
+             * Clear the callback thread and return.
+             */
+            h->write_callback_thread = NULL;
+            on_write_complete = NULL;
+        }
+
+        pj_ioqueue_unlock_key(h);
+        PJ_RACE_ME(5);
+
+        /* Invoke the callback or return */
+        if (on_write_complete) {
+            (*on_write_complete)(h, write_op->app_op_key,
+                                 write_op->pending_key.overlapped.bytes_read);
+
+            release_pending_op(h, write_op);
+            ++event_cnt;
+        } else {
+            break;
+        }
+    }
+
+    return event_cnt;
+}
+#endif
 
 /*
  * Poll the I/O Completion Port, execute callback, 
@@ -906,18 +1122,98 @@ static pj_bool_t poll_iocp( HANDLE hIocp, DWORD dwTimeout,
                 return PJ_TRUE;
         }
 
-        /* We shouldn't call callbacks if key is quitting. */
+        /* When key is closing, still invoke write callbacks so upper
+         * layers can release resources (e.g., pjsip_tx_data_dec_ref).
+         * Read/accept callbacks can be safely skipped. See #4878.
+         */
         if (key->closing) {
-            release_pending_op(key, op);
+            if (operation == PJ_IOQUEUE_OP_WRITE ||
+                operation == PJ_IOQUEUE_OP_SEND ||
+                operation == PJ_IOQUEUE_OP_SEND_TO)
+            {
+                increment_counter(key);
+                OPKEY_OPERATION(op_key) = 0;
+                if (key->cb.on_write_complete) {
+                    key->cb.on_write_complete(key, op_key,
+                                              -(pj_ssize_t)PJ_ECANCELLED);
+                }
+                release_pending_op(key, op);
+                decrement_counter(key);
+            } else {
+                release_pending_op(key, op);
+            }
             return PJ_TRUE;
         }
 
-        /* If concurrency is disabled, lock the key 
+        /* If concurrency is disabled, lock the key
          * (and save the lock status to local var since app may change
          * concurrency setting while in the callback) */
         if (key->allow_concurrent == PJ_FALSE) {
-            pj_ioqueue_lock_key(key);
             has_lock = PJ_TRUE;
+            pj_ioqueue_lock_key(key);
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+            if (operation == PJ_IOQUEUE_OP_READ ||
+                operation == PJ_IOQUEUE_OP_RECV ||
+                operation == PJ_IOQUEUE_OP_RECV_FROM)
+            {
+                /* If we're not allowing concurrency, we must prevent
+                 * re-entrancy in the callback.
+                 */
+                if (key->read_callback_thread) {
+                    /* Another thread is in the read callback for this key,
+                     * just queue this read_op, that thread will invoke the
+                     * callback later.
+                     */
+                    op->pending_key.overlapped.bytes_read = size_status;
+                    pj_list_erase(op);
+                    pj_list_push_back(&key->read_cb_list, op);
+                    pj_ioqueue_unlock_key(key);
+                    return PJ_TRUE;
+                }
+
+                /* Save the thread invoking the read callback.
+                 * Note that when threading is disabled or concurrency is
+                 * allowed, this will always be NULL.
+                 */
+                key->read_callback_thread = pj_thread_this();
+
+                /* Do not hold mutex while invoking callback */
+                has_lock = PJ_FALSE;
+                pj_ioqueue_unlock_key(key);
+                PJ_RACE_ME(5);
+            }
+            else if (operation == PJ_IOQUEUE_OP_WRITE ||
+                     operation == PJ_IOQUEUE_OP_SEND ||
+                     operation == PJ_IOQUEUE_OP_SEND_TO)
+            {
+                /* If we're not allowing concurrency, we must prevent
+                 * re-entrancy in the callback.
+                 */
+                if (key->write_callback_thread) {
+                    /* Another thread is in the write callback for this key,
+                     * just queue this write_op, that thread will invoke the
+                     * callback later.
+                     */
+                    op->pending_key.overlapped.bytes_read = size_status;
+                    pj_list_erase(op);
+                    pj_list_push_back(&key->write_cb_list, op);
+                    pj_ioqueue_unlock_key(key);
+                    return PJ_TRUE;
+                }
+
+                /* Save the thread invoking the write callback.
+                 * Note that when threading is disabled or concurrency is
+                 * allowed, this will always be NULL.
+                 */
+                key->write_callback_thread = pj_thread_this();
+
+                /* Do not hold mutex while invoking callback */
+                has_lock = PJ_FALSE;
+                pj_ioqueue_unlock_key(key);
+                PJ_RACE_ME(5);
+            }
+#endif
         } else {
             has_lock = PJ_FALSE;
         }
@@ -927,7 +1223,43 @@ static pj_bool_t poll_iocp( HANDLE hIocp, DWORD dwTimeout,
             if (has_lock) {
                 pj_ioqueue_unlock_key(key);
             }
-            release_pending_op(key, op);
+            /* Still invoke write callbacks, see first closing check
+             * above and #4878.
+             */
+            if (operation == PJ_IOQUEUE_OP_WRITE ||
+                operation == PJ_IOQUEUE_OP_SEND ||
+                operation == PJ_IOQUEUE_OP_SEND_TO)
+            {
+                increment_counter(key);
+                OPKEY_OPERATION(op_key) = 0;
+                if (key->cb.on_write_complete) {
+                    key->cb.on_write_complete(key, op_key,
+                                              -(pj_ssize_t)PJ_ECANCELLED);
+                }
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+                /* Clear write_callback_thread that was set before this
+                 * closing check. Without this, cancel_all_pending_op
+                 * would wait and timeout. See #4878.
+                 */
+                pj_ioqueue_lock_key(key);
+                key->write_callback_thread = NULL;
+                pj_ioqueue_unlock_key(key);
+#endif
+                release_pending_op(key, op);
+                decrement_counter(key);
+            } else {
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+                if (operation == PJ_IOQUEUE_OP_READ ||
+                    operation == PJ_IOQUEUE_OP_RECV ||
+                    operation == PJ_IOQUEUE_OP_RECV_FROM)
+                {
+                    pj_ioqueue_lock_key(key);
+                    key->read_callback_thread = NULL;
+                    pj_ioqueue_unlock_key(key);
+                }
+#endif
+                release_pending_op(key, op);
+            }
             return PJ_TRUE;
         }
 
@@ -987,6 +1319,24 @@ static pj_bool_t poll_iocp( HANDLE hIocp, DWORD dwTimeout,
             pj_ioqueue_unlock_key(key);
 
         release_pending_op(key, op);
+
+#if PJ_IOQUEUE_CALLBACK_NO_LOCK
+        if (operation == PJ_IOQUEUE_OP_READ ||
+            operation == PJ_IOQUEUE_OP_RECV ||
+            operation == PJ_IOQUEUE_OP_RECV_FROM)
+        {
+            /* If we have more pending read callback, process it now */
+            ioqueue_dispatch_read_event_no_lock(key, 0);
+        }
+        else if (operation == PJ_IOQUEUE_OP_WRITE ||
+                 operation == PJ_IOQUEUE_OP_SEND ||
+                 operation == PJ_IOQUEUE_OP_SEND_TO)
+        {
+            /* If we have more pending write callback, process it now */
+            ioqueue_dispatch_write_event_no_lock(key, 0);
+        }
+#endif
+
         decrement_counter(key);
 
         return PJ_TRUE;
@@ -1067,11 +1417,14 @@ PJ_DEF(pj_status_t) pj_ioqueue_unregister( pj_ioqueue_key_t *key )
     //CloseHandle(key->hnd);
     pj_sock_close((pj_sock_t)key->hnd);
 
-    /* Reset callbacks */
+    /* Reset callbacks. Keep on_write_complete alive so that cancelled
+     * overlapped write ops arriving via IOCP can still invoke it for
+     * resource cleanup (e.g., pjsip_tx_data_dec_ref). See #4878.
+     */
     key->cb.on_accept_complete = NULL;
     key->cb.on_connect_complete = NULL;
     key->cb.on_read_complete = NULL;
-    key->cb.on_write_complete = NULL;
+    //key->cb.on_write_complete = NULL;
 
     /* Even after handle is closed, I suspect that IOCP may still try to
      * do something with the handle, causing memory corruption when pool

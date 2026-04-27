@@ -209,17 +209,22 @@ pj_status_t pjsua_call_subsys_init(const pjsua_config *cfg)
     const pj_str_t str_trickle_ice = { "trickle-ice", 11 };
     pj_status_t status;
 
-    /* Init calls array. */
-    for (i=0; i<PJ_ARRAY_SIZE(pjsua_var.calls); ++i)
-        reset_call(i);
-
     /* Copy config */
     pjsua_config_dup(pjsua_var.pool, &pjsua_var.ua_cfg, cfg);
 
     /* Verify settings */
-    if (pjsua_var.ua_cfg.max_calls >= PJSUA_MAX_CALLS) {
+    if (pjsua_var.ua_cfg.max_calls > PJSUA_MAX_CALLS) 
         pjsua_var.ua_cfg.max_calls = PJSUA_MAX_CALLS;
-    }
+    
+    pjsua_var.calls = (pjsua_call *)pj_pool_zalloc(pjsua_var.pool,
+                                                   sizeof(pjsua_call) *
+                                                   pjsua_var.ua_cfg.max_calls);
+    if (!pjsua_var.calls)
+        return PJ_ENOMEM;
+
+    /* Init calls array. */
+    for (i = 0U; i < pjsua_var.ua_cfg.max_calls; ++i)
+        reset_call(i);
 
     /* Check the route URI's and force loose route if required */
     for (i=0; i<pjsua_var.ua_cfg.outbound_proxy_cnt; ++i) {
@@ -247,8 +252,10 @@ pj_status_t pjsua_call_subsys_init(const pjsua_config *cfg)
     PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
 
     /* Add "norefersub" in Supported header */
-    pjsip_endpt_add_capability(pjsua_var.endpt, NULL, PJSIP_H_SUPPORTED,
-                               NULL, 1, &str_norefersub);
+    if (pjsua_var.ua_cfg.no_refer_sub) {
+        pjsip_endpt_add_capability(pjsua_var.endpt, NULL, PJSIP_H_SUPPORTED,
+                                   NULL, 1, &str_norefersub);
+    }
 
     /* Add "INFO" in Allow header, for DTMF and video key frame request. */
     pjsip_endpt_add_capability(pjsua_var.endpt, NULL, PJSIP_H_ALLOW,
@@ -942,6 +949,30 @@ PJ_DEF(pj_status_t) pjsua_call_make_call(pjsua_acc_id acc_id,
             status = PJSIP_EINVALIDREQURI;
             goto on_error;
         }
+
+        /* Verify contact URI if provided */
+        if (msg_data && msg_data->contact_uri.slen) {
+            pj_strdup_with_null(tmp_pool, &dup, &msg_data->contact_uri);
+            uri = pjsip_parse_uri(tmp_pool, dup.ptr, dup.slen, 0);
+            if (uri == NULL) {
+                pjsua_perror(THIS_FILE, "Invalid contact URI",
+                             PJSIP_EINVALIDREQURI);
+                status = PJSIP_EINVALIDREQURI;
+                goto on_error;
+            }
+        }
+
+        /* Verify local URI if provided */
+        if (msg_data && msg_data->local_uri.slen) {
+            pj_strdup_with_null(tmp_pool, &dup, &msg_data->local_uri);
+            uri = pjsip_parse_uri(tmp_pool, dup.ptr, dup.slen, 0);
+            if (uri == NULL) {
+                pjsua_perror(THIS_FILE, "Invalid local URI",
+                             PJSIP_EINVALIDREQURI);
+                status = PJSIP_EINVALIDREQURI;
+                goto on_error;
+            }
+        }
     }
 
     /* Mark call start time. */
@@ -951,9 +982,11 @@ PJ_DEF(pj_status_t) pjsua_call_make_call(pjsua_acc_id acc_id,
     call->res_time.sec = 0;
 
     /* Create suitable Contact header unless a Contact header has been
-     * set in the account.
+     * set in the account or message data.
      */
-    if (acc->contact.slen) {
+    if (msg_data && msg_data->contact_uri.slen) {
+        contact = msg_data->contact_uri;
+    } else if (acc->contact.slen) {
         contact = acc->contact;
     } else {
         status = pjsua_acc_create_uac_contact(tmp_pool, &contact,
@@ -1002,6 +1035,12 @@ PJ_DEF(pj_status_t) pjsua_call_make_call(pjsua_acc_id acc_id,
 
     if (acc->cfg.use_shared_auth) {
         pjsip_dlg_set_auth_sess(dlg, &acc->shared_auth_sess);
+    } else if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc->index;
+        pjsip_auth_clt_async_configure(&dlg->auth_sess, &async_opt);
     }
 
     /* Calculate call's secure level */
@@ -1379,6 +1418,7 @@ static pj_status_t verify_request(const pjsua_call *call,
 
     if (status == PJ_SUCCESS) {
         unsigned options = 0;
+        pjsip_tx_data *tx_data_resp = NULL;
 
         /* Add SIPREC support to prevent the "bad extension" error */
         options |= PJSIP_INV_SUPPORT_SIPREC;
@@ -1387,17 +1427,20 @@ static pj_status_t verify_request(const pjsua_call *call,
         status = pjsip_inv_verify_request3(rdata,
                                            call->inv->pool_prov, &options, 
                                            offer, answer, NULL, 
-                                           pjsua_var.endpt, response);
+                                           pjsua_var.endpt, &tx_data_resp);
         if (status != PJ_SUCCESS) {
             /*
              * No we can't handle the incoming INVITE request.
              */
             pjsua_perror(THIS_FILE, "Request verification failed", status);
 
-            if (response)
-                err_code = (*response)->msg->line.status.code;
+            if (tx_data_resp)
+                err_code = tx_data_resp->msg->line.status.code;
             else
-                err_code = PJSIP_SC_NOT_ACCEPTABLE_HERE;                
+                err_code = PJSIP_SC_NOT_ACCEPTABLE_HERE;
+
+            if (response)
+                *response = tx_data_resp;
         }
     }
 
@@ -1725,8 +1768,19 @@ pj_bool_t pjsua_call_on_incoming(pjsip_rx_data *rdata)
     }
 
     if (!replaced_dlg) {
-        /* Clone rdata. */
-        pjsip_rx_data_clone(rdata, 0, &call->incoming_data);
+        /* Clone rdata — needed for on_incoming_call callback.
+         * Without it, incoming_data stays NULL and on_incoming_call
+         * is silently skipped, so reject the call on failure.
+         */
+        status = pjsip_rx_data_clone(rdata, 0, &call->incoming_data);
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(1, (THIS_FILE, status,
+                          "Failed to clone rdata for incoming call"));
+            ret_st_code = PJSIP_SC_INTERNAL_SERVER_ERROR;
+            pjsip_endpt_respond_stateless(pjsua_var.endpt, rdata,
+                                          ret_st_code, NULL, NULL, NULL);
+            goto on_return;
+        }
     }
 
     /*
@@ -1842,6 +1896,8 @@ pj_bool_t pjsua_call_on_incoming(pjsip_rx_data *rdata)
     options |= PJSIP_INV_SUPPORT_100REL;
     options |= PJSIP_INV_SUPPORT_TIMER;
 
+#if PJSUA_HAS_SIPREC
+
     if(pjsua_var.acc[acc_id].cfg.use_siprec != PJSUA_SIP_SIPREC_INACTIVE){
         options |= PJSIP_INV_SUPPORT_SIPREC;
         if(pjsua_var.acc[acc_id].cfg.use_siprec == PJSUA_SIP_SIPREC_MANDATORY){
@@ -1879,6 +1935,7 @@ pj_bool_t pjsua_call_on_incoming(pjsip_rx_data *rdata)
         goto on_return;
     }
 
+#endif
 
     if (pjsua_var.acc[acc_id].cfg.require_100rel == PJSUA_100REL_MANDATORY)
         options |= PJSIP_INV_REQUIRE_100REL;
@@ -1983,6 +2040,18 @@ pj_bool_t pjsua_call_on_incoming(pjsip_rx_data *rdata)
         pjsip_auth_clt_set_credentials(&dlg->auth_sess,
                                        pjsua_var.acc[acc_id].cred_cnt,
                                        pjsua_var.acc[acc_id].cred);
+    }
+
+    /* Set shared or non-shared async auth for incoming call dialog */
+    if (pjsua_var.acc[acc_id].cfg.use_shared_auth) {
+        pjsip_dlg_set_auth_sess(dlg,
+                                &pjsua_var.acc[acc_id].shared_auth_sess);
+    } else if (pjsua_var.ua_cfg.cb.on_auth_challenge) {
+        pjsip_auth_clt_async_setting async_opt;
+        pj_bzero(&async_opt, sizeof(async_opt));
+        async_opt.cb = &pjsua_auth_on_challenge;
+        async_opt.user_data = (void*)(pj_ssize_t)acc_id;
+        pjsip_auth_clt_async_configure(&dlg->auth_sess, &async_opt);
     }
 
     /* Set preference */
@@ -2569,6 +2638,10 @@ PJ_DEF(pj_status_t) pjsua_call_get_info( pjsua_call_id call_id,
         info->media_status = call->media[call->audio_idx].state;
         info->media_dir = call->media[call->audio_idx].dir;
         info->conf_slot = call->media[call->audio_idx].strm.a.conf_slot;
+    } else {
+        info->media_status = PJSUA_CALL_MEDIA_NONE;
+        info->media_dir = PJMEDIA_DIR_NONE;
+        info->conf_slot = PJSUA_INVALID_ID;
     }
 
     /* Build array of provisional media info */
@@ -2938,8 +3011,8 @@ PJ_DEF(pj_status_t) pjsua_call_answer2(pjsua_call_id call_id,
                                                     msg_data);
         }
         pj_list_push_back(&call->async_call.call_var.inc_call.answers,
-                          answer);
-
+            answer);
+       
         PJSUA_UNLOCK();
         if (dlg) pjsip_dlg_dec_lock(dlg);
         pj_log_pop_indent();
@@ -4102,9 +4175,11 @@ PJ_DEF(void) pjsua_call_hangup_all(void)
     // This may deadlock, see https://github.com/pjsip/pjproject/issues/1305
     //PJSUA_LOCK();
 
-    for (i=0; i<pjsua_var.ua_cfg.max_calls; ++i) {
-        if (pjsua_var.calls[i].inv)
-            pjsua_call_hangup(i, 0, NULL, NULL);
+    if (pjsua_var.calls) {
+        for (i=0; i<pjsua_var.ua_cfg.max_calls; ++i) {
+            if (pjsua_var.calls[i].inv)
+                pjsua_call_hangup(i, 0, NULL, NULL);
+        }
     }
 
     //PJSUA_UNLOCK();
@@ -6537,7 +6612,15 @@ static void pjsua_call_on_tsx_state_changed(pjsip_inv_session *inv,
             /* Either we get non-2xx or media update failed,
              * revert back provisional media.
              */
-            pjsua_media_prov_revert(call->index);
+            if (inv->invite_tsx == NULL || tsx == inv->invite_tsx) {
+                pjsua_media_prov_revert(call->index);
+            }
+            else
+            {
+                PJ_LOG(4, (THIS_FILE, "Retaining provisional media for call %d "
+                    "since this is not the active Invite",
+                    call->index));
+            }
         }
     } else if (tsx->role == PJSIP_ROLE_UAC &&
                pjsip_method_cmp(&tsx->method, &pjsip_update_method)==0 &&

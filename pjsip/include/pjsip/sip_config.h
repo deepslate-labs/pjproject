@@ -558,7 +558,7 @@ PJ_INLINE(pjsip_cfg_t*) pjsip_cfg(void)
  * access module.
  */
 #ifndef PJSIP_SAFE_MODULE
-#   define PJSIP_SAFE_MODULE            1
+#   define PJSIP_SAFE_MODULE            0
 #endif
 
 
@@ -1573,6 +1573,19 @@ PJ_INLINE(pjsip_cfg_t*) pjsip_cfg(void)
 #ifndef PJSIP_INV_UPDATE_EARLY_CHECK_RELIABLE
 #   define PJSIP_INV_UPDATE_EARLY_CHECK_RELIABLE    0
 #endif
+
+/**
+ * Specify whether message info will include additional details such as
+ * Call-ID and To header information in the log output. When enabled,
+ * the message info string will contain more detailed information to
+ * help with debugging and monitoring.
+ *
+ * Default: 0 (disabled)
+ */
+#ifndef PJSIP_MSG_INFO_HAS_EXTRA_DETAILS
+#   define PJSIP_MSG_INFO_HAS_EXTRA_DETAILS    0
+#endif
+
 
 /**
  * Dump configuration to log with verbosity equal to info(3).

@@ -64,7 +64,7 @@
 #   define PJMEDIA_STREAM_INC   4000
 #endif
 
-/* Number of DTMF E bit transmissions */
+/* Default number of DTMF E bit transmissions */
 #define DTMF_EBIT_RETRANSMIT_CNT        3
 
 /*  Number of send error before repeat the report. */
@@ -76,7 +76,7 @@ struct dtmf
     int             event;
     pj_uint32_t     duration;
     pj_uint32_t     send_duration;
-    int             ebit_cnt;               /**< # of E bit transmissions   */
+    unsigned        ebit_cnt;               /**< # of E bit transmissions   */
 };
 
 
@@ -114,8 +114,8 @@ struct pjmedia_stream
     unsigned                 dec_buf_count; /**< Number of samples in the
                                                  decoding buffer.           */
 
-    pj_uint16_t              dec_ptime;     /**< Decoder frame ptime in ms. */
-    pj_uint8_t               dec_ptime_denum;/**< Decoder ptime denum.      */
+    volatile pj_uint16_t     dec_ptime;     /**< Decoder frame ptime in ms. */
+    volatile pj_uint8_t      dec_ptime_denum;/**< Decoder ptime denum.      */
     pj_bool_t                detect_ptime_change;
                                             /**< Detect decode ptime change */
 
@@ -139,6 +139,15 @@ struct pjmedia_stream
     int                      tx_event_pt;   /**< Outgoing pt for dtmf.      */
     int                      tx_dtmf_count; /**< # of digits in tx dtmf buf.*/
     struct dtmf              tx_dtmf_buf[32];/**< Outgoing dtmf queue.      */
+    pj_uint32_t              tx_dtmf_pause_dur;
+                                            /**< Outgoing DTMF full pause
+                                                 (in timestamp).            */
+    pj_int8_t                tx_dtmf_vol;   /**< Outgoing DTMF volume.      */
+    pj_uint32_t              tx_dtmf_ebit_rep_cnt;
+                                            /**< Outgoing DTMF end bit
+                                                 packet repetition count.   */
+    pj_uint32_t              tx_dtmf_pause_rem;
+                                            /**< Outgoing DTMF rem. pause.  */
 
     /* Incoming DTMF: */
     int                      rx_event_pt;   /**< Incoming pt for dtmf.      */
@@ -200,6 +209,107 @@ static void on_rx_rtcp( void *data,
 
 #include "stream_imp_common.c"
 
+
+/* Generate synthetic samples using PLC or zero-fill.
+ * This function may leave samples in the decoder buffer.
+ * Return 1 if PLC is invoked, otherwise return 0.
+ */
+static int synthesize_samples(pjmedia_stream *stream,
+                              unsigned samples_required,
+                              unsigned samples_per_decode,
+                              pjmedia_frame* frame_out)
+{
+    pjmedia_frame frame_out_;
+    unsigned samples_count = 0, out_buf_len;
+    pj_status_t status;
+
+    /* Verify the output frame size */
+    out_buf_len = (unsigned)frame_out->size / 2;
+    if (samples_required > out_buf_len) {
+        PJ_LOG(5, (stream->base.port.info.name.ptr,
+                   "Bad params in synthesize samples: "
+                   "required=%u decode=%u, buf-size=%u",
+                   samples_required, samples_per_decode, out_buf_len));
+        pjmedia_zero_samples(frame_out->buf, out_buf_len);
+        return 0;
+    }
+
+    /* Zero-fill when:
+     * - PLC is not supported/active, or
+     * - PLC limit has been reached.
+     */
+    if (!stream->codec->op->recover ||
+        !stream->codec_param.setting.plc ||
+        stream->plc_cnt >= stream->max_plc_cnt)
+    {
+        pjmedia_zero_samples(frame_out->buf, samples_required);
+        return 0;
+    }
+
+    /* Decode to decoder buffer when samples_per_decode > samples_required */
+    if (stream->dec_buf && samples_per_decode > samples_required) {
+        ++stream->plc_cnt;
+        frame_out_.buf  = stream->dec_buf;
+        frame_out_.size = stream->dec_buf_size;
+        status = pjmedia_codec_recover(stream->codec,
+                                        (unsigned)frame_out_.size,
+                                        &frame_out_);
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(5, (stream->base.port.info.name.ptr, status,
+                          "Codec recover failed"));
+            pjmedia_zero_samples(frame_out->buf, samples_required);
+            return 1;
+        }
+
+        /* Copy samples from the decoder buffer */
+        if (frame_out_.size / 2 > samples_required) {
+            pjmedia_copy_samples(frame_out->buf, stream->dec_buf,
+                                 samples_required);
+
+            /* Leave the rest in the decoder buffer */
+            stream->dec_buf_pos = samples_required;
+            stream->dec_buf_count = (unsigned)frame_out_.size / 2;
+        } else {
+            /* Not enough samples generated, copy whatever we have */
+            unsigned samples_avail = (unsigned)frame_out_.size / 2;
+            pjmedia_copy_samples(frame_out->buf, stream->dec_buf,
+                                 samples_avail);
+            pjmedia_zero_samples((pj_int16_t*)frame_out->buf + samples_avail,
+                                 samples_required - samples_avail);
+        }
+
+        return 1;
+    }
+
+    /* Decode directly to output frame */
+    frame_out_ = *frame_out;
+    do {
+        ++stream->plc_cnt;
+        status = pjmedia_codec_recover(stream->codec,
+                                       (unsigned)frame_out_.size,
+                                       &frame_out_);
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(5, (stream->base.port.info.name.ptr, status,
+                          "Codec recover failed"));
+            break;
+        }
+
+        samples_count += (unsigned)frame_out_.size / 2;
+        frame_out_.buf = (pj_int16_t*)frame_out->buf + samples_count;
+        frame_out_.size = frame_out->size - samples_count*2;
+    } while (samples_count < samples_required &&
+             stream->plc_cnt < stream->max_plc_cnt);
+
+    /* Fill the rest with zeroes after PLC fails or over limit */
+    if (samples_count < samples_required) {
+        pjmedia_zero_samples((pj_int16_t*)frame_out->buf + samples_count,
+                             samples_required - samples_count);
+    }
+
+    return 1;
+}
+
+
 /*
  * play_callback()
  *
@@ -256,6 +366,11 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
         pj_size_t frame_size = channel->buf_size;
         pj_uint32_t bit_info;
 
+        /* Get samples from the decoder buffer first, if any.
+         * The decoder buffer is currently only used by Opus when
+         * the stream frame is smaller than the decoder frame,
+         * e.g: stream frame is 20ms while decoder frame is 60ms.
+         */
         if (stream->dec_buf && stream->dec_buf_pos < stream->dec_buf_count) {
             unsigned nsamples_req = samples_required - samples_count;
             unsigned nsamples_avail = stream->dec_buf_count -
@@ -279,36 +394,25 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
 #endif
 
         if (frame_type == PJMEDIA_JB_MISSING_FRAME) {
+            pjmedia_frame frame_out = {0};
+            unsigned samples_needed;
+            pj_bool_t plc_invoked;
 
-            /* Activate PLC */
-            if (stream->codec->op->recover &&
-                stream->codec_param.setting.plc &&
-                stream->plc_cnt < stream->max_plc_cnt)
-            {
-                pjmedia_frame frame_out;
+            frame_out.buf = p_out_samp + samples_count;
+            frame_out.size = frame->size - samples_count*2;
 
-                frame_out.buf = p_out_samp + samples_count;
-                frame_out.size = frame->size - samples_count*2;
-                status = pjmedia_codec_recover(stream->codec,
-                                               (unsigned)frame_out.size,
-                                               &frame_out);
-
-                ++stream->plc_cnt;
-
-            } else {
-                status = -1;
-            }
-
-            if (status != PJ_SUCCESS) {
-                /* Either PLC failed or PLC not supported/enabled */
-                pjmedia_zero_samples(p_out_samp + samples_count,
-                                     samples_required - samples_count);
-            }
+            /* Generate only a frame (samples_per_frame) */
+            samples_needed = samples_required - samples_count;
+            if (samples_needed > samples_per_frame)
+                samples_needed = samples_per_frame;
+            plc_invoked = synthesize_samples(stream, samples_needed,
+                                             samples_per_frame, &frame_out);
+            samples_count += samples_needed;
 
             if (frame_type != c_strm->jb_last_frm) {
                 /* Report changing frame type event */
                 PJ_LOG(5,(c_strm->port.info.name.ptr, "Frame lost%s!",
-                          (status == PJ_SUCCESS? ", recovered":"")));
+                          (plc_invoked? ", recovered":"")));
 
                 c_strm->jb_last_frm = frame_type;
                 c_strm->jb_last_frm_cnt = 1;
@@ -316,7 +420,6 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
                 c_strm->jb_last_frm_cnt++;
             }
 
-            samples_count += samples_per_frame;
         } else if (frame_type == PJMEDIA_JB_ZERO_EMPTY_FRAME) {
 
             const char *with_plc = "";
@@ -329,36 +432,20 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
             //lost and not the subsequent ones.
             //if (frame_type != c_strm->jb_last_frm) {
             if (1) {
-                /* Activate PLC to smoothen the missing frame */
-                if (stream->codec->op->recover &&
-                    stream->codec_param.setting.plc &&
-                    stream->plc_cnt < stream->max_plc_cnt)
+                pjmedia_frame frame_out = {0};
+                unsigned samples_needed;
+
+                frame_out.buf = p_out_samp + samples_count;
+                frame_out.size = frame->size - samples_count*2;
+
+                /* Generate all required (may be multiple frames) */
+                samples_needed = samples_required - samples_count;
+                if (synthesize_samples(stream, samples_needed,
+                                       samples_per_frame, &frame_out))
                 {
-                    pjmedia_frame frame_out;
-
-                    do {
-                        frame_out.buf = p_out_samp + samples_count;
-                        frame_out.size = frame->size - samples_count*2;
-                        status = pjmedia_codec_recover(stream->codec,
-                                                       (unsigned)frame_out.size,
-                                                       &frame_out);
-                        if (status != PJ_SUCCESS)
-                            break;
-
-                        samples_count += samples_per_frame;
-                        ++stream->plc_cnt;
-
-                    } while (samples_count < samples_required &&
-                             stream->plc_cnt < stream->max_plc_cnt);
-
                     with_plc = ", plc invoked";
                 }
-            }
-
-            if (samples_count < samples_required) {
-                pjmedia_zero_samples(p_out_samp + samples_count,
-                                     samples_required - samples_count);
-                samples_count = samples_required;
+                samples_count += samples_needed;
             }
 
             if (c_strm->jb_last_frm != frame_type) {
@@ -380,40 +467,23 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
         } else if (frame_type != PJMEDIA_JB_NORMAL_FRAME) {
 
             const char *with_plc = "";
+            pjmedia_frame frame_out = {0};
+            unsigned samples_needed;
 
             /* It can only be PJMEDIA_JB_ZERO_PREFETCH frame */
             pj_assert(frame_type == PJMEDIA_JB_ZERO_PREFETCH_FRAME);
 
-            /* Always activate PLC when it's available.. */
-            if (stream->codec->op->recover &&
-                stream->codec_param.setting.plc &&
-                stream->plc_cnt < stream->max_plc_cnt)
+            frame_out.buf = p_out_samp + samples_count;
+            frame_out.size = frame->size - samples_count*2;
+
+            /* Generate all required (may be multiple frames) */
+            samples_needed = samples_required - samples_count;
+            if (synthesize_samples(stream, samples_needed,
+                                    samples_per_frame, &frame_out))
             {
-                pjmedia_frame frame_out;
-
-                do {
-                    frame_out.buf = p_out_samp + samples_count;
-                    frame_out.size = frame->size - samples_count*2;
-                    status = pjmedia_codec_recover(stream->codec,
-                                                   (unsigned)frame_out.size,
-                                                   &frame_out);
-                    if (status != PJ_SUCCESS)
-                        break;
-                    samples_count += samples_per_frame;
-
-                    ++stream->plc_cnt;
-
-                } while (samples_count < samples_required &&
-                         stream->plc_cnt < stream->max_plc_cnt);
-
                 with_plc = ", plc invoked";
             }
-
-            if (samples_count < samples_required) {
-                pjmedia_zero_samples(p_out_samp + samples_count,
-                                     samples_required - samples_count);
-                samples_count = samples_required;
-            }
+            samples_count += samples_needed;
 
             if (c_strm->jb_last_frm != frame_type) {
                 pjmedia_jb_state jb_state;
@@ -446,6 +516,10 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
 
             frame_out.buf = p_out_samp + samples_count;
             frame_out.size = frame->size - samples_count*BYTES_PER_SAMPLE;
+
+            /* Check if we need to use the decode buffer, i.e: codec is opus
+             * and the decoded frame is larger than the stream frame.
+             */
             if (stream->dec_buf &&
                 bit_info * sizeof(pj_int16_t) > frame_out.size)
             {
@@ -467,9 +541,13 @@ static pj_status_t get_frame( pjmedia_port *port, pjmedia_frame *frame)
                 if (use_dec_buf) {
                     pjmedia_zero_samples(stream->dec_buf,
                                          stream->dec_buf_count);
+                    stream->dec_buf_count = 0;
                 } else {
+                    unsigned samples_needed = samples_required - samples_count;
+                    if (samples_needed > frame_out.size / 2)
+                        samples_needed = (unsigned)frame_out.size / 2;
                     pjmedia_zero_samples(p_out_samp + samples_count,
-                                         samples_per_frame);
+                                         samples_needed);
                 }
             } else if (use_dec_buf) {
                 stream->dec_buf_count = (unsigned)frame_out.size /
@@ -785,7 +863,7 @@ static void create_dtmf_payload(pjmedia_stream *stream,
         digit->duration = duration;
 
     event->event = (pj_uint8_t)digit->event;
-    event->e_vol = 10;
+    event->e_vol = PJ_ABS(stream->tx_dtmf_vol);
     event->duration = pj_htons((pj_uint16_t)digit->duration);
 
     if (forced_last) {
@@ -795,7 +873,7 @@ static void create_dtmf_payload(pjmedia_stream *stream,
     if (digit->duration >= duration) {
         event->e_vol |= 0x80;
 
-        if (++digit->ebit_cnt >= DTMF_EBIT_RETRANSMIT_CNT) {
+        if (++digit->ebit_cnt >= (1U + stream->tx_dtmf_ebit_rep_cnt)) {
             *last = 1;
 
             /* Prepare next digit. */
@@ -805,11 +883,28 @@ static void create_dtmf_payload(pjmedia_stream *stream,
                            stream->tx_dtmf_count, 0);
             --stream->tx_dtmf_count;
 
+            /* add pause after each completed digit */
+            stream->tx_dtmf_pause_rem = stream->tx_dtmf_pause_dur;
+
             pj_mutex_unlock(c_strm->jb_mutex);
         }
     }
 
     frame_out->size = 4;
+}
+
+
+/*
+ * Process (count down) DTMF pause
+ */
+static void process_dtmf_pause(pjmedia_stream *stream)
+{
+    if (stream->tx_dtmf_pause_rem > stream->rtp_tx_ts_len_per_pkt) {
+        stream->tx_dtmf_pause_rem -= stream->rtp_tx_ts_len_per_pkt;
+    }
+    else {
+        stream->tx_dtmf_pause_rem = 0U;
+    }
 }
 
 
@@ -1021,10 +1116,11 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
     frame_out.buf = ((char*)channel->buf) + sizeof(pjmedia_rtp_hdr);
     frame_out.size = 0;
 
-    /* If we have DTMF digits in the queue, transmit the digits.
+    /* If we have DTMF digits in the queue (and no pause is remaining), transmit
+     * the digits.
      * Otherwise encode the PCM buffer.
      */
-    if (stream->tx_dtmf_count) {
+    if (stream->tx_dtmf_count && (stream->tx_dtmf_pause_rem == 0U)) {
         int first=0, last=0;
 
         create_dtmf_payload(stream, &frame_out, 0, &first, &last);
@@ -1046,7 +1142,7 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
              * RTP packets.
              */
             inc_timestamp = stream->dtmf_duration +
-                            ((DTMF_EBIT_RETRANSMIT_CNT-1) *
+                            ((stream->tx_dtmf_ebit_rep_cnt) *
                              stream->rtp_tx_ts_len_per_pkt)
                             - rtp_ts_len;
         }
@@ -1068,6 +1164,9 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
                (c_strm->dir & PJMEDIA_DIR_ENCODING))
     {
         pjmedia_frame silence_frame;
+
+        /* process a possibly ongoing DTMF pause */
+        process_dtmf_pause(stream);
 
         pj_bzero(&silence_frame, sizeof(silence_frame));
         silence_frame.buf = stream->zero_frame;
@@ -1098,6 +1197,9 @@ static pj_status_t put_frame_imp( pjmedia_port *port,
                 frame->buf != NULL) ||
                (frame->type == PJMEDIA_FRAME_TYPE_EXTENDED))
     {
+        /* process a possibly ongoing DTMF pause */
+        process_dtmf_pause(stream);
+
         /* Encode! */
         status = pjmedia_codec_encode( stream->codec, frame,
                                        channel->buf_size -
@@ -1976,7 +2078,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_create( pjmedia_endpt *endpt,
         ptime <<= 1;
 
         /* Allocate buffer */
-        stream->enc_buf_size = afd->clock_rate * ptime / 1000 / 1000;
+        stream->enc_buf_size = ptime / 1000 * afd->clock_rate / 1000;
         c_strm->enc_buf = (pj_int16_t*)
                           pj_pool_alloc(pool, stream->enc_buf_size * 2);
 
@@ -2018,12 +2120,17 @@ PJ_DEF(pj_status_t) pjmedia_stream_create( pjmedia_endpt *endpt,
     /* Disable PLC until a "NORMAL" frame is gotten from the jitter buffer. */
     stream->plc_cnt = stream->max_plc_cnt;
 
+    /* TX DTMF is just initialized with default values here */
 #if defined(PJMEDIA_DTMF_DURATION_MSEC) && (PJMEDIA_DTMF_DURATION_MSEC > 0)
     stream->dtmf_duration = PJMEDIA_DTMF_DURATION_MSEC *
                             afd->clock_rate / 1000;
 #else
     stream->dtmf_duration = PJMEDIA_DTMF_DURATION;
 #endif
+    stream->tx_dtmf_pause_dur = 0U;
+    stream->tx_dtmf_vol = -10;
+    stream->tx_dtmf_ebit_rep_cnt = (DTMF_EBIT_RETRANSMIT_CNT - 1U);
+    stream->tx_dtmf_pause_rem = 0U;
 
 #if defined(PJMEDIA_HANDLE_G722_MPEG_BUG) && (PJMEDIA_HANDLE_G722_MPEG_BUG!=0)
     stream->rtp_rx_check_cnt = 50;
@@ -2658,6 +2765,48 @@ PJ_DEF(pj_status_t) pjmedia_stream_resume( pjmedia_stream *stream,
     return PJ_SUCCESS;
 }
 
+
+/*
+ * Set DTMF transmission options of this stream
+ */
+PJ_DEF(pj_status_t)
+pjmedia_stream_set_tx_dtmf_options(pjmedia_stream *stream,
+                                   pj_uint32_t duration_ms,
+                                   pj_uint32_t pause_ms,
+                                   pj_uint8_t pt,
+                                   pj_int8_t vol,
+                                   pj_uint32_t ebit_rep_cnt)
+{
+    pjmedia_stream_common *c_strm = (pjmedia_stream_common *)stream;
+    pjmedia_audio_format_detail *afd;
+
+    PJ_ASSERT_RETURN(stream &&
+                     (duration_ms <= 1000U) &&
+                     (pause_ms <= 1000U) &&
+                     (vol >= -63) && (vol <= 0) &&
+                     (ebit_rep_cnt <= 7U), PJ_EINVAL);
+
+    /* By convention we use jitter buffer mutex to access DTMF queue. */
+    pj_mutex_lock(c_strm->jb_mutex);
+
+    afd = pjmedia_format_get_audio_format_detail(&c_strm->port.info.fmt, 1);
+
+    /* convert durations to timestamps */
+    stream->dtmf_duration = duration_ms * afd->clock_rate / 1000U;
+    stream->tx_dtmf_pause_dur = pause_ms * afd->clock_rate / 1000U;
+
+    /* take other options as they are */
+    stream->tx_event_pt = pt;
+    stream->tx_dtmf_vol = vol;
+    stream->tx_dtmf_ebit_rep_cnt = ebit_rep_cnt;
+
+    /* Unlock jitter buffer mutex. */
+    pj_mutex_unlock(c_strm->jb_mutex);
+
+    return PJ_SUCCESS;
+}
+
+
 /*
  * Dial DTMF
  */
@@ -2686,7 +2835,7 @@ PJ_DEF(pj_status_t) pjmedia_stream_dial_dtmf2( pjmedia_stream *stream,
 
     pj_mutex_lock(c_strm->jb_mutex);
 
-    if (stream->tx_dtmf_count+digit_char->slen >=
+    if (stream->tx_dtmf_count+digit_char->slen >
         (long)PJ_ARRAY_SIZE(stream->tx_dtmf_buf))
     {
         status = PJ_ETOOMANY;
@@ -2839,6 +2988,26 @@ PJ_DEF(pj_status_t) pjmedia_stream_set_dtmf_event_callback(pjmedia_stream *strea
     pj_mutex_unlock(c_strm->jb_mutex);
 
     return PJ_SUCCESS;
+}
+
+/*
+ * Get the number of queued DTMF digits for transmission.
+ */
+PJ_DEF(unsigned) pjmedia_get_queued_dtmf_digits(pjmedia_stream *stream)
+{
+    pjmedia_stream_common *c_strm = (pjmedia_stream_common *)stream;
+    unsigned count;
+
+    PJ_ASSERT_RETURN(stream, 0);
+
+    /* By convention, we use jitter buffer's mutex to access DTMF
+     * digits resources.
+     */
+    pj_mutex_lock(c_strm->jb_mutex);
+    count = stream->tx_dtmf_count;
+    pj_mutex_unlock(c_strm->jb_mutex);
+
+    return count;
 }
 
 /*
